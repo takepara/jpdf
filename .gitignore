@@ -1,0 +1,4 @@
+# Ignore source and generated PDF files
+*.pdf
+.vscode/
+__pycache__/
