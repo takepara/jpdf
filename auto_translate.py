@@ -1,35 +1,108 @@
-import json
-import time
-import re
 import argparse
+import json
 import math
-from pathlib import Path
+import os
+import re
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from deep_translator import GoogleTranslator
+from pathlib import Path
 
 BLOCK_MARKER_TEMPLATE = "__PDFTRANSLATE_BLOCK_{index}__"
+LMSTUDIO_DEFAULT_BASE_URL = "http://127.0.0.1:1234/v1"
+GOOGLE_TRANSLATE_DEFAULT_URL = "https://translate.googleapis.com/translate_a/single"
+
+
+def load_dotenv_file(env_path):
+    if not env_path.exists() or not env_path.is_file():
+        return 0
+
+    loaded = 0
+    with open(env_path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            if line.startswith("export "):
+                line = line[len("export ") :].strip()
+
+            if "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+
+            if not key:
+                continue
+
+            if len(value) >= 2 and (
+                (value[0] == '"' and value[-1] == '"')
+                or (value[0] == "'" and value[-1] == "'")
+            ):
+                value = value[1:-1]
+
+            if key not in os.environ:
+                os.environ[key] = value
+                loaded += 1
+
+    return loaded
+
+
+def load_dotenv_candidates(source_pdf_path=None, explicit_env_file=None):
+    candidates = []
+    if explicit_env_file:
+        candidates.append(Path(explicit_env_file).expanduser())
+
+    cwd_env = Path.cwd() / ".env"
+    if cwd_env not in candidates:
+        candidates.append(cwd_env)
+
+    script_env = Path(__file__).resolve().parent / ".env"
+    if script_env not in candidates:
+        candidates.append(script_env)
+
+    if source_pdf_path:
+        source_env = Path(source_pdf_path).resolve().parent / ".env"
+        if source_env not in candidates:
+            candidates.append(source_env)
+
+    loaded_total = 0
+    loaded_files = []
+    for path in candidates:
+        loaded = load_dotenv_file(path)
+        if loaded > 0:
+            loaded_total += loaded
+            loaded_files.append(str(path))
+
+    return loaded_total, loaded_files
+
 
 def normalize_text(text):
     return re.sub(r"\s+", " ", text).strip()
 
+
 def is_page_number_or_code(text):
-    # If the text is just a number, keep it as is
-    if re.match(r'^\d+$', text.strip()):
+    stripped = (text or "").strip()
+    if re.match(r"^\d+$", stripped):
         return True
-    # If the text is empty or just whitespace
-    if not text.strip():
+    if not stripped:
         return True
-    # If the text is a single character or short symbol, or URL
-    if len(text.strip()) <= 1:
+    if len(stripped) <= 1:
         return True
     return False
+
 
 def is_short_text(text):
     return len(normalize_text(text)) <= 80
 
+
 def restore_hyphenation(text):
-    # example: transla-\ntion -> translation
     return re.sub(r"([A-Za-z])\-\n([A-Za-z])", r"\1\2", text)
+
 
 def normalize_for_translation(text, preserve_paragraph_break=True):
     text = restore_hyphenation(text)
@@ -47,6 +120,7 @@ def normalize_for_translation(text, preserve_paragraph_break=True):
 
     return text
 
+
 def looks_like_heading(block):
     text = normalize_text(block["text"])
     if not text:
@@ -62,6 +136,7 @@ def looks_like_heading(block):
         return True
     return False
 
+
 def looks_like_toc_line(block):
     text = normalize_text(block["text"])
     if not text:
@@ -74,11 +149,13 @@ def looks_like_toc_line(block):
         return True
     return False
 
+
 def looks_like_list_line(block):
     text = normalize_text(block["text"])
     if not text:
         return False
     return bool(re.match(r"^([\-\u2022]|\d+[\.)])\s+", text))
+
 
 def classify_block_kind(block):
     if is_page_number_or_code(block["text"]):
@@ -91,16 +168,23 @@ def classify_block_kind(block):
         return "heading"
     return "paragraph"
 
+
 def same_column(prev_block, next_block):
     return abs(prev_block.get("x0", prev_block["bbox"][0]) - next_block.get("x0", next_block["bbox"][0])) <= 20
+
 
 def vertical_gap(prev_block, next_block):
     prev_y1 = prev_block.get("y1", prev_block["bbox"][3])
     next_y0 = next_block.get("y0", next_block["bbox"][1])
     return next_y0 - prev_y1
 
+
 def font_close(prev_block, next_block):
-    return abs(prev_block.get("size", 0) - next_block.get("size", 0)) <= 1.5 and prev_block.get("font") == next_block.get("font")
+    return (
+        abs(prev_block.get("size", 0) - next_block.get("size", 0)) <= 1.5
+        and prev_block.get("font") == next_block.get("font")
+    )
+
 
 def prev_ends_mid_sentence(text):
     stripped = text.strip()
@@ -114,6 +198,7 @@ def prev_ends_mid_sentence(text):
         return True
     return False
 
+
 def starts_like_continuation(text):
     stripped = text.strip()
     if not stripped:
@@ -123,6 +208,7 @@ def starts_like_continuation(text):
     if re.match(r"^(and|or|but|to|for|with|of|the)\b", stripped, flags=re.IGNORECASE):
         return True
     return False
+
 
 def should_merge_blocks(prev_block, next_block, prev_kind, next_kind):
     if is_page_number_or_code(prev_block["text"]) or is_page_number_or_code(next_block["text"]):
@@ -163,6 +249,7 @@ def should_merge_blocks(prev_block, next_block, prev_kind, next_kind):
             return True, "short_paragraph_lines"
 
     return False, "default_break"
+
 
 def build_translation_segments(blocks):
     ordered_blocks = sorted(blocks, key=lambda block: (block["page"], block.get("reading_order", block["block_idx"])))
@@ -206,6 +293,7 @@ def build_translation_segments(blocks):
 
     return segments
 
+
 def create_segment_payload(segment):
     lines = []
     for index, block in enumerate(segment):
@@ -213,6 +301,7 @@ def create_segment_payload(segment):
         lines.append(marker)
         lines.append(normalize_for_translation(block["text"], preserve_paragraph_break=False))
     return "\n".join(lines)
+
 
 def split_translated_segment(translated_text, expected_count):
     segments = {}
@@ -239,25 +328,132 @@ def split_translated_segment(translated_text, expected_count):
         return None
     return [segments[index] for index in range(expected_count)]
 
-def translate_text(translator, text):
-    cleaned_text = text.strip()
-    translated_text = None
-    for attempt in range(3):
-        try:
-            translated_text = translator.translate(cleaned_text)
-            break
-        except Exception:
-            time.sleep(0.5)
-    return translated_text
 
-def translate_single_block(block):
+def build_translate_prompt(text, keep_markers=False):
+    marker_rule = "Keep all marker lines like __PDFTRANSLATE_BLOCK_0__ unchanged and on their own lines." if keep_markers else ""
+    return (
+        "Translate the following English text into natural Japanese. "
+        "Keep numbers, units, URLs, product names, model numbers, and proper nouns unchanged. "
+        "Output only the Japanese translation text. "
+        f"{marker_rule}\n\n"
+        f"SOURCE:\n{text}"
+    )
+
+
+def lmstudio_complete(base_url, model, prompt, temperature=0.2, timeout=120, max_tokens=4096):
+    url = f"{base_url.rstrip('/')}/completions"
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        body = response.read().decode("utf-8")
+
+    parsed = json.loads(body)
+    choices = parsed.get("choices", [])
+    if not choices:
+        return None
+
+    return (choices[0].get("text", "") or "").strip()
+
+
+def google_translate_text(text, timeout=30):
+    params = {
+        "client": "gtx",
+        "sl": "auto",
+        "tl": "ja",
+        "dt": "t",
+        "q": text,
+    }
+    query = urllib.parse.urlencode(params)
+    url = f"{GOOGLE_TRANSLATE_DEFAULT_URL}?{query}"
+
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        body = response.read().decode("utf-8")
+
+    parsed = json.loads(body)
+    translated_parts = parsed[0] if isinstance(parsed, list) and parsed else []
+    if not translated_parts:
+        return None
+
+    pieces = []
+    for part in translated_parts:
+        if isinstance(part, list) and part and part[0]:
+            pieces.append(part[0])
+    translated = "".join(pieces).strip()
+    return translated or None
+
+
+def translate_with_lmstudio(llm_options, text, keep_markers=False):
+    cleaned = text.strip()
+    if not cleaned:
+        return cleaned
+
+    prompt = build_translate_prompt(cleaned, keep_markers=keep_markers)
+    translated = None
+    for _ in range(3):
+        try:
+            translated = lmstudio_complete(
+                base_url=llm_options["base_url"],
+                model=llm_options["model"],
+                prompt=prompt,
+                temperature=llm_options["temperature"],
+                timeout=llm_options["timeout"],
+                max_tokens=llm_options["max_tokens"],
+            )
+            if translated:
+                break
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError, Exception):
+            time.sleep(0.5)
+
+    return translated
+
+
+def translate_with_google(text, timeout=30):
+    cleaned = text.strip()
+    if not cleaned:
+        return cleaned
+
+    translated = None
+    for _ in range(3):
+        try:
+            translated = google_translate_text(cleaned, timeout=timeout)
+            if translated:
+                break
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError, Exception):
+            time.sleep(0.5)
+    return translated
+
+
+def translate_text(translate_options, text, keep_markers=False):
+    engine = translate_options.get("engine", "google")
+    if engine == "llm":
+        return translate_with_lmstudio(translate_options["llm"], text, keep_markers=keep_markers)
+    return translate_with_google(text, timeout=translate_options.get("google_timeout", 30))
+
+
+def translate_single_block(block, translate_options):
     text = block["text"]
     if is_page_number_or_code(text):
         translated_text = text
     else:
-        translator = GoogleTranslator(source="en", target="ja")
         normalized = normalize_for_translation(text, preserve_paragraph_break=False)
-        translated_text = translate_text(translator, normalized)
+        translated_text = translate_text(translate_options, normalized, keep_markers=False)
         if not translated_text:
             translated_text = text
 
@@ -266,13 +462,14 @@ def translate_single_block(block):
     block_copy["original_text"] = text
     return block_copy
 
+
 def split_japanese_chunks(text):
-    # Split by sentence-ending punctuation while preserving punctuation.
     parts = re.split(r"(?<=[。！？!?])\s+", text.strip())
     chunks = [part.strip() for part in parts if part.strip()]
     if not chunks:
         chunks = [text.strip()]
     return chunks
+
 
 def estimate_block_capacity(block):
     source_len = len(normalize_text(block.get("text", "")))
@@ -282,6 +479,7 @@ def estimate_block_capacity(block):
     visual_capacity = (width / size) * line_count
     return max(8.0, source_len * 0.6 + visual_capacity)
 
+
 def assign_chunks_to_blocks(chunks, blocks):
     if not chunks:
         return None
@@ -289,7 +487,6 @@ def assign_chunks_to_blocks(chunks, blocks):
     if len(chunks) < len(blocks):
         expanded = []
         for chunk in chunks:
-            # Try finer split for long sentence chunks when block count is larger.
             parts = re.split(r"(?<=[、，,])\s+", chunk)
             refined = [part.strip() for part in parts if part.strip()]
             if len(refined) >= 2:
@@ -325,7 +522,6 @@ def assign_chunks_to_blocks(chunks, blocks):
             assigned[block_index].append(chunks[idx])
             idx += 1
 
-    # Safety: distribute leftover chunks to the last block.
     if idx < len(chunks):
         assigned[-1].extend(chunks[idx:])
 
@@ -334,14 +530,15 @@ def assign_chunks_to_blocks(chunks, blocks):
         return None
     return results
 
-def translate_paragraph_segment(segment, translator):
+
+def translate_paragraph_segment(segment, translate_options):
     blocks = segment["blocks"]
     if len(blocks) == 1:
-        translated_block = translate_single_block(blocks[0])
+        translated_block = translate_single_block(blocks[0], translate_options)
         return [translated_block], "single_paragraph"
 
     joined = "\n\n".join(normalize_for_translation(block["text"], preserve_paragraph_break=True) for block in blocks)
-    translated = translate_text(translator, joined)
+    translated = translate_text(translate_options, joined, keep_markers=False)
     if not translated:
         return None, "paragraph_translate_failed"
 
@@ -358,10 +555,14 @@ def translate_paragraph_segment(segment, translator):
         translated_blocks.append(block_copy)
     return translated_blocks, "paragraph_reassigned"
 
-def translate_structured_segment(segment, translator):
+
+def translate_structured_segment(segment, translate_options):
+    if translate_options.get("engine", "google") != "llm":
+        return None, "structured_requires_llm"
+
     blocks = segment["blocks"]
     payload = create_segment_payload(blocks)
-    translated_payload = translate_text(translator, payload)
+    translated_payload = translate_text(translate_options, payload, keep_markers=True)
     if translated_payload:
         split_result = split_translated_segment(translated_payload, len(blocks))
         if split_result is not None:
@@ -375,12 +576,13 @@ def translate_structured_segment(segment, translator):
 
     return None, "structured_split_failed"
 
-def translate_segment(segment, index, total):
+
+def translate_segment(segment, index, llm_options):
     blocks = segment["blocks"]
     kind = segment["kind"]
 
     if len(blocks) == 1 and kind != "paragraph":
-        translated_block = translate_single_block(blocks[0])
+        translated_block = translate_single_block(blocks[0], llm_options)
         return index, [translated_block], {
             "kind": kind,
             "strategy": "single_block",
@@ -390,21 +592,19 @@ def translate_segment(segment, index, total):
             "source_preview": normalize_text(blocks[0]["text"])[:180],
         }
 
-    translator = GoogleTranslator(source="en", target="ja")
-
     strategy = "structured"
     translated_blocks = None
     result_note = ""
 
     if kind == "paragraph":
         strategy = "paragraph_reflow"
-        translated_blocks, result_note = translate_paragraph_segment(segment, translator)
+        translated_blocks, result_note = translate_paragraph_segment(segment, llm_options)
     else:
-        translated_blocks, result_note = translate_structured_segment(segment, translator)
+        translated_blocks, result_note = translate_structured_segment(segment, llm_options)
 
     if translated_blocks is None:
         strategy = "block_fallback"
-        translated_blocks = [translate_single_block(block) for block in blocks]
+        translated_blocks = [translate_single_block(block, llm_options) for block in blocks]
         result_note = f"{result_note}|fallback"
 
     for block_copy in translated_blocks:
@@ -419,24 +619,24 @@ def translate_segment(segment, index, total):
         "source_preview": normalize_text(" ".join(block["text"] for block in blocks))[:180],
     }
 
-def translate_blocks(input_json, output_json, debug_json_path=None):
+
+def translate_blocks(input_json, output_json, llm_options, debug_json_path=None):
     with open(input_json, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     translation_segments = build_translation_segments(data)
-    print(
-        f"Starting context-aware translation of {len(data)} blocks in {len(translation_segments)} segments...",
-        flush=True,
-    )
+    engine = llm_options.get("engine", "google")
+    engine_label = "LM Studio" if engine == "llm" else "Google Translate"
+    print(f"Starting {engine_label} translation of {len(data)} blocks in {len(translation_segments)} segments...", flush=True)
 
     translated_count = 0
-
     segment_slots = [None] * len(translation_segments)
     segment_debug = [None] * len(translation_segments)
-    max_workers = 8
+
+    max_workers = max(1, int(llm_options.get("max_workers", 1)))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(translate_segment, segment, idx, len(translation_segments)): idx
+            executor.submit(translate_segment, segment, idx, llm_options): idx
             for idx, segment in enumerate(translation_segments)
         }
 
@@ -456,10 +656,7 @@ def translate_blocks(input_json, output_json, debug_json_path=None):
     for translated_segment in segment_slots:
         translated_blocks.extend(translated_segment)
 
-    results_by_key = {
-        (block["page"], block["block_idx"]): block
-        for block in translated_blocks
-    }
+    results_by_key = {(block["page"], block["block_idx"]): block for block in translated_blocks}
     results = []
     for original_block in data:
         block_copy = results_by_key[(original_block["page"], original_block["block_idx"])]
@@ -471,16 +668,34 @@ def translate_blocks(input_json, output_json, debug_json_path=None):
         json.dump(results, f, ensure_ascii=False, indent=2)
 
     if debug_json_path:
+        debug_payload = {
+            "segment_debug": segment_debug,
+            "engine": engine,
+            "workers": max_workers,
+        }
+        if engine == "llm":
+            llm_cfg = llm_options["llm"]
+            debug_payload["llm"] = {
+                "provider": "lmstudio",
+                "model": llm_cfg["model"],
+                "base_url": llm_cfg["base_url"],
+                "temperature": llm_cfg["temperature"],
+                "max_tokens": llm_cfg["max_tokens"],
+                "max_workers": max_workers,
+            }
         with open(debug_json_path, "w", encoding="utf-8") as f:
-            json.dump(segment_debug, f, ensure_ascii=False, indent=2)
+            json.dump(debug_payload, f, ensure_ascii=False, indent=2)
 
     print(f"Completed translation! Saved to {output_json}. Total translated: {translated_count}", flush=True)
 
-def build_default_output_pdf(source_pdf):
-    source_path = Path(source_pdf)
-    return str(source_path.with_name(f"{source_path.stem}_JA.pdf"))
 
-def run_pipeline(source_pdf, output_pdf=None):
+def build_default_output_pdf(source_pdf, engine="google"):
+    source_path = Path(source_pdf)
+    suffix = "_LLM" if engine == "llm" else "_G"
+    return str(source_path.with_name(f"{source_path.stem}{suffix}.pdf"))
+
+
+def run_pipeline(source_pdf, output_pdf, translate_options):
     from extract import extract_pdf_text
     from generate import generate_translated_pdf
 
@@ -488,7 +703,8 @@ def run_pipeline(source_pdf, output_pdf=None):
     if not source_path.exists():
         raise FileNotFoundError(f"Source PDF not found: {source_pdf}")
 
-    output_pdf = output_pdf or build_default_output_pdf(source_pdf)
+    engine = translate_options.get("engine", "google")
+    output_pdf = output_pdf or build_default_output_pdf(source_pdf, engine=engine)
     extracted_json = str(source_path.with_name(f"{source_path.stem}_extracted_text.json"))
     translated_json = str(source_path.with_name(f"{source_path.stem}_translated_text.json"))
     segment_debug_json = str(source_path.with_name(f"{source_path.stem}_segment_debug.json"))
@@ -496,13 +712,20 @@ def run_pipeline(source_pdf, output_pdf=None):
     print(f"[1/4] Extracting text blocks from: {source_pdf}", flush=True)
     extract_pdf_text(str(source_path), extracted_json)
 
-    print(f"[2/4] Translating blocks to Japanese", flush=True)
-    translate_blocks(extracted_json, translated_json, debug_json_path=segment_debug_json)
+    engine_label = "LM Studio" if engine == "llm" else "Google Translate"
+    print(f"[2/4] Translating blocks to Japanese with {engine_label}", flush=True)
+    translate_blocks(
+        extracted_json,
+        translated_json,
+        llm_options=translate_options,
+        debug_json_path=segment_debug_json,
+    )
 
-    print(f"[3/3] Generating translated PDF: {output_pdf}", flush=True)
+    print(f"[3/4] Generating translated PDF: {output_pdf}", flush=True)
     generate_translated_pdf(str(source_path), translated_json, output_pdf)
 
-    print("Done.", flush=True)
+    print("[4/4] Done.", flush=True)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -514,6 +737,77 @@ if __name__ == "__main__":
         nargs="?",
         help="Path to output Japanese PDF (default: <source_stem>_JA.pdf)",
     )
+    parser.add_argument(
+        "--engine",
+        choices=["google", "llm"],
+        default=os.environ.get("TRANSLATION_ENGINE", "google"),
+        help="Translation engine: google (default) or llm",
+    )
+    parser.add_argument(
+        "--lmstudio-base-url",
+        default=os.environ.get("LMSTUDIO_BASE_URL", LMSTUDIO_DEFAULT_BASE_URL),
+        help="LM Studio OpenAI-compatible base URL",
+    )
+    parser.add_argument(
+        "--lmstudio-model",
+        default=os.environ.get("LMSTUDIO_MODEL", "translategemma-4b-it"),
+        help="LM Studio model name",
+    )
+    parser.add_argument(
+        "--lmstudio-timeout",
+        type=int,
+        default=int(os.environ.get("LMSTUDIO_TIMEOUT", "120")),
+        help="LM Studio HTTP timeout seconds",
+    )
+    parser.add_argument(
+        "--lmstudio-max-tokens",
+        type=int,
+        default=int(os.environ.get("LMSTUDIO_MAX_TOKENS", "4096")),
+        help="LM Studio max_tokens per call",
+    )
+    parser.add_argument(
+        "--lmstudio-temperature",
+        type=float,
+        default=float(os.environ.get("LMSTUDIO_TEMPERATURE", "0.2")),
+        help="LM Studio sampling temperature",
+    )
+    parser.add_argument(
+        "--lmstudio-max-workers",
+        type=int,
+        default=int(os.environ.get("LMSTUDIO_MAX_WORKERS", "8")),
+        help="Concurrent translation workers",
+    )
+    parser.add_argument(
+        "--google-timeout",
+        type=int,
+        default=int(os.environ.get("GOOGLE_TIMEOUT", "30")),
+        help="Google Translate HTTP timeout seconds",
+    )
+    parser.add_argument(
+        "--env-file",
+        default=None,
+        help="Optional .env file path. By default, .env in cwd/script/source-pdf dir are auto-loaded.",
+    )
     args = parser.parse_args()
 
-    run_pipeline(args.source_pdf, args.output_pdf)
+    loaded_count, loaded_files = load_dotenv_candidates(
+        source_pdf_path=args.source_pdf,
+        explicit_env_file=args.env_file,
+    )
+    if loaded_count > 0:
+        print(f"Loaded {loaded_count} env vars from: {', '.join(loaded_files)}", flush=True)
+
+    translate_options = {
+        "engine": args.engine,
+        "google_timeout": args.google_timeout,
+        "max_workers": args.lmstudio_max_workers,
+        "llm": {
+            "base_url": args.lmstudio_base_url,
+            "model": args.lmstudio_model,
+            "timeout": args.lmstudio_timeout,
+            "max_tokens": args.lmstudio_max_tokens,
+            "temperature": args.lmstudio_temperature,
+        },
+    }
+
+    run_pipeline(args.source_pdf, args.output_pdf, translate_options=translate_options)

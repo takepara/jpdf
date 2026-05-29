@@ -55,9 +55,25 @@ def has_meaningful_vertical_overlap(rect, other, ratio=0.3):
     return overlap >= min(rect.height, other.height) * ratio
 
 
-def adjust_paragraph_rect(rect, page_rect, peer_rects, self_index):
+def is_decorative_overlay_block(block, rect, page_rect):
+    # Large background/display words can overlap many rows and should not be
+    # treated as a true right-column neighbor for paragraph clipping.
+    text_len = len(normalize_render_text(block.get("text", ""), segment_kind=block.get("segment_kind", "")).strip())
+    area = rect.width * rect.height
+    page_area = max(1.0, page_rect.width * page_rect.height)
+    if text_len <= 12 and area >= page_area * 0.20:
+        return True
+    if text_len <= 8 and rect.height >= page_rect.height * 0.45:
+        return True
+    return False
+
+
+def adjust_paragraph_rect(rect, page_rect, peer_rects, peer_blocks, self_index):
     # Generic rule for any PDF: respect nearest right neighbor in the same rows.
-    right_neighbor_boundary = page_rect.x1 - 24
+    left_margin = max(0.0, rect.x0 - page_rect.x0)
+    # Keep right margin close to the left margin so lines do not stretch too far.
+    mirrored_right_margin = max(24.0, left_margin)
+    right_neighbor_boundary = page_rect.x1 - mirrored_right_margin
     has_right_neighbor = False
 
     for idx, peer in enumerate(peer_rects):
@@ -65,12 +81,14 @@ def adjust_paragraph_rect(rect, page_rect, peer_rects, self_index):
             continue
         if peer.x0 <= rect.x0 + 20:
             continue
+        if is_decorative_overlay_block(peer_blocks[idx], peer, page_rect):
+            continue
         if not has_meaningful_vertical_overlap(rect, peer):
             continue
         has_right_neighbor = True
         right_neighbor_boundary = min(right_neighbor_boundary, peer.x0 - 10)
 
-    desired_right = min(page_rect.x1 - 24, rect.x0 + max(rect.width * 1.35, rect.width + 120))
+    desired_right = min(page_rect.x1 - mirrored_right_margin, rect.x0 + max(rect.width * 1.35, rect.width + 120))
 
     if has_right_neighbor:
         safe_right = min(desired_right, right_neighbor_boundary)
@@ -173,7 +191,7 @@ def generate_translated_pdf(original_pdf, json_path, output_pdf):
             align = 0
             translated_text = normalize_render_text(block["text"], segment_kind=block.get("segment_kind"))
             if block.get("segment_kind") == "paragraph":
-                bbox, has_right_neighbor = adjust_paragraph_rect(bbox, page_rect, page_rects, block_index)
+                bbox, has_right_neighbor = adjust_paragraph_rect(bbox, page_rect, page_rects, page_blocks, block_index)
                 # Justify only on wide single-column paragraphs.
                 if not has_right_neighbor and bbox.width >= page_width * 0.55:
                     align = 3

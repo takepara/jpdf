@@ -1,4 +1,8 @@
 # Ignore source and generated PDF files
+*.json
 *.pdf
 .vscode/
 __pycache__/
+.env
+.env.*
+!.env.example
