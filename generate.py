@@ -6,6 +6,34 @@ import argparse
 
 QUOTE_ONLY_TOKENS = {"\"", "'", "“", "”", "‘", "’", "「", "」", "『", "』"}
 
+
+def normalize_list_render_text(text):
+    text = re.sub(r"\s*\n+\s*", " ", text).strip()
+    text = re.sub(r"\s{2,}", " ", text)
+
+    # Split list items by common bullet/number markers while keeping the marker.
+    bullet_chars = r"[•・●◦▪■□◆◇▶▸▹▻]"
+    numbered_markers = r"(?:\([1-9]\d?\)|(?<!\d)[1-9]\d?[.)](?!\d)|[①-⑳])"
+    marker_pattern = rf"(?:{bullet_chars}|{numbered_markers})"
+
+    text = re.sub(rf"\s*({marker_pattern})\s*", r" \1 ", text)
+    parts = re.split(rf"\s+(?={marker_pattern}\s+)", text)
+
+    normalized_lines = []
+    for part in parts:
+        item = part.strip()
+        if not item:
+            continue
+
+        # If marker and body were detached, keep them on one line.
+        item = re.sub(rf"^({marker_pattern})\s*", r"\1 ", item)
+        item = re.sub(r"\s{2,}", " ", item)
+        normalized_lines.append(item)
+
+    if normalized_lines:
+        return "\n".join(normalized_lines)
+    return text
+
 def normalize_paragraph_render_text(text):
     text = re.sub(r"\s*\n+\s*", " ", text).strip()
     text = re.sub(r"\s{2,}", " ", text)
@@ -40,7 +68,9 @@ def normalize_render_text(text, segment_kind=None):
     normalized = re.sub(rf"(?<=[0-9A-Za-z%])\s+(?=[{cjk}])", "", normalized)
     normalized = re.sub(r"(?<=\d)\s+(?=%)", "", normalized)
 
-    if segment_kind == "paragraph":
+    if segment_kind == "list":
+        normalized = normalize_list_render_text(normalized)
+    elif segment_kind == "paragraph":
         normalized = normalize_paragraph_render_text(normalized)
 
     normalized = re.sub(r"[\s\u00A0]*[“”‘’「」『』]+$", "", normalized)

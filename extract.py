@@ -2,6 +2,73 @@ import json
 import fitz # PyMuPDF
 import argparse
 
+
+def _line_rep_span(line):
+    spans = line.get("spans", [])
+    if not spans:
+        return None
+    return next((s for s in spans if (s.get("text", "") or "").strip()), spans[0])
+
+
+def _paragraph_groups_from_lines(lines):
+    def is_bullet_marker(text):
+        stripped = (text or "").strip()
+        if not stripped:
+            return False
+        return stripped in {"•", "-", "*", "・"}
+
+    def ends_sentence(text):
+        stripped = (text or "").strip()
+        if not stripped:
+            return False
+        return stripped.endswith((".", "!", "?", ":", ";", "。", "！", "？"))
+
+    groups = []
+    current = []
+    current_min_x0 = None
+
+    for line in lines:
+        spans = line.get("spans", [])
+        if not spans:
+            continue
+
+        line_text = "".join(span.get("text", "") for span in spans)
+        if not line_text.strip():
+            if current:
+                groups.append(current)
+                current = []
+                current_min_x0 = None
+            continue
+
+        lx0, _, _, _ = line.get("bbox", (0.0, 0.0, 0.0, 0.0))
+
+        if current:
+            prev_line = current[-1]
+            prev_text = "".join(span.get("text", "") for span in prev_line.get("spans", []))
+            prev_x0, _, _, _ = prev_line.get("bbox", (lx0, 0.0, 0.0, 0.0))
+
+            indent_jump_from_prev = (lx0 - prev_x0) >= 20
+            indent_jump_from_group = current_min_x0 is not None and (lx0 - current_min_x0) >= 20
+            should_split_for_indent = (
+                (indent_jump_from_prev or indent_jump_from_group)
+                and ends_sentence(prev_text)
+                and not is_bullet_marker(prev_text)
+                and not is_bullet_marker(line_text)
+            )
+
+            if should_split_for_indent:
+                groups.append(current)
+                current = []
+                current_min_x0 = None
+
+        current.append(line)
+        current_min_x0 = lx0 if current_min_x0 is None else min(current_min_x0, lx0)
+
+    if current:
+        groups.append(current)
+
+    return groups
+
 def extract_pdf_text(pdf_path, json_path):
     doc = fitz.open(pdf_path)
     extracted_data = []
@@ -11,70 +78,70 @@ def extract_pdf_text(pdf_path, json_path):
         blocks = page.get_text("dict")["blocks"]
         reading_order = 0
         
-        for block_idx, block in enumerate(blocks):
+        for block in blocks:
             if block.get("type") != 0: # Skip image/non-text blocks
                 continue
             
             lines = block.get("lines", [])
             if not lines:
                 continue
-                
-            # Collect text and analyze properties
-            spans_info = []
-            text_parts = []
-            
-            for line in lines:
-                line_text = ""
-                for span in line.get("spans", []):
-                    text = span.get("text", "")
-                    line_text += text
-                    spans_info.append(span)
-                # Keep line parts intact
-                if line_text:
-                    text_parts.append(line_text)
-            
-            # Join lines in a block with a space (standard paragraph reflow)
-            # but preserve tabs if present
-            full_text = "\n".join(text_parts)
-            
-            # Strip outer whitespace and check if empty
-            if not full_text.strip():
-                continue
-                
-            # Find representative font properties from the spans
-            if spans_info:
-                # Use the first span with non-empty text as representative
-                rep_span = next((s for s in spans_info if s.get("text", "").strip()), spans_info[0])
-                font_name = rep_span.get("font", "helv")
-                font_size = rep_span.get("size", 10.0)
-                color_int = rep_span.get("color", 0)
-                # Convert color integer to PDF RGB float tuple
-                color_rgb = fitz.sRGB_to_pdf(color_int)
-            else:
-                font_name = "helv"
-                font_size = 10.0
-                color_rgb = (0.0, 0.0, 0.0)
 
-            x0, y0, x1, y1 = block["bbox"]
-                
-            extracted_data.append({
-                "page": page_num,
-                "block_idx": block_idx,
-                "bbox": block["bbox"],
-                "text": full_text,
-                "size": font_size,
-                "color": color_rgb,
-                "font": font_name,
-                "x0": x0,
-                "y0": y0,
-                "x1": x1,
-                "y1": y1,
-                "width": x1 - x0,
-                "height": y1 - y0,
-                "line_count": len(text_parts),
-                "reading_order": reading_order
-            })
-            reading_order += 1
+            for group in _paragraph_groups_from_lines(lines):
+                text_parts = []
+                x0 = float("inf")
+                y0 = float("inf")
+                x1 = float("-inf")
+                y1 = float("-inf")
+                rep_span = None
+
+                for line in group:
+                    spans = line.get("spans", [])
+                    line_text = "".join(span.get("text", "") for span in spans)
+                    if line_text.strip():
+                        text_parts.append(line_text)
+
+                    lx0, ly0, lx1, ly1 = line.get("bbox", block["bbox"])
+                    x0 = min(x0, lx0)
+                    y0 = min(y0, ly0)
+                    x1 = max(x1, lx1)
+                    y1 = max(y1, ly1)
+
+                    if rep_span is None:
+                        rep_span = _line_rep_span(line)
+
+                full_text = "\n".join(text_parts)
+                if not full_text.strip():
+                    continue
+
+                if rep_span is not None:
+                    font_name = rep_span.get("font", "helv")
+                    font_size = rep_span.get("size", 10.0)
+                    color_int = rep_span.get("color", 0)
+                    color_rgb = fitz.sRGB_to_pdf(color_int)
+                else:
+                    font_name = "helv"
+                    font_size = 10.0
+                    color_rgb = (0.0, 0.0, 0.0)
+
+                bbox = [x0, y0, x1, y1]
+                extracted_data.append({
+                    "page": page_num,
+                    "block_idx": reading_order,
+                    "bbox": bbox,
+                    "text": full_text,
+                    "size": font_size,
+                    "color": color_rgb,
+                    "font": font_name,
+                    "x0": x0,
+                    "y0": y0,
+                    "x1": x1,
+                    "y1": y1,
+                    "width": x1 - x0,
+                    "height": y1 - y0,
+                    "line_count": len(text_parts),
+                    "reading_order": reading_order
+                })
+                reading_order += 1
             
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(extracted_data, f, ensure_ascii=False, indent=2)

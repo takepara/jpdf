@@ -467,6 +467,7 @@ def build_translate_prompt(text, keep_markers=False):
     return (
         "Translate the following English text into natural Japanese. "
         "Keep numbers, units, URLs, product names, model numbers, and proper nouns unchanged. "
+        "Do not copy any full English sentence or long English phrase from SOURCE into the output. "
         "Output only the Japanese translation text. "
         f"{marker_rule}\n\n"
         f"SOURCE:\n{text}"
@@ -488,12 +489,48 @@ def build_structured_translate_prompt(payload_json):
         "You are a professional English-to-Japanese translator for business reports. "
         "Translate each item's text into natural Japanese while preserving meaning. "
         "Keep numbers, units, URLs, product names, model numbers, and proper nouns unchanged. "
+        "For each item, do not copy any full English sentence or long English phrase from the input into t. "
         "Return ONLY valid JSON with this exact shape: "
         '{"items":[{"id":"<same id>","t":"<translated text>"}]} . '
         "Do not add commentary, markdown fences, or extra keys. "
         "Keep all item ids exactly as given and return one output item per input item.\n\n"
         f"INPUT_JSON:\n{payload_json}"
     )
+
+
+def has_verbatim_source_overlap(source_text, output_text, min_source_chars=40, min_words=12):
+    source = normalize_text(source_text)
+    output = normalize_text(output_text)
+    if not source or not output:
+        return False
+
+    source_lower = source.lower()
+    output_lower = output.lower()
+
+    # Direct full-source echo.
+    if len(source_lower) >= min_source_chars and source_lower in output_lower:
+        return True
+
+    # Sentence-level echo for long English clauses.
+    sentence_candidates = [
+        normalize_text(part)
+        for part in re.split(r"[\n\r.!?;:]+", source)
+        if normalize_text(part)
+    ]
+    for candidate in sentence_candidates:
+        words = re.findall(r"[A-Za-z][A-Za-z0-9'\-/]*", candidate)
+        if len(words) >= min_words and candidate.lower() in output_lower:
+            return True
+
+    # Sliding window over English tokens to detect long phrase reuse.
+    english_tokens = re.findall(r"[A-Za-z][A-Za-z0-9'\-/]*", source)
+    if len(english_tokens) >= min_words:
+        for start in range(0, len(english_tokens) - min_words + 1):
+            phrase = " ".join(english_tokens[start : start + min_words]).lower()
+            if phrase in output_lower:
+                return True
+
+    return False
 
 
 def format_request_log_label(request_meta):
@@ -674,9 +711,6 @@ def build_structured_translation_items(data):
         items.append(
             {
                 "id": f"p{block['page']}_b{block['block_idx']}",
-                "p": block["page"],
-                "b": block["block_idx"],
-                "k": classify_block_kind(block),
                 "t": normalized,
             }
         )
@@ -722,6 +756,7 @@ def translate_structured_items_once(items, llm_options, batch_label=""):
     if not parsed:
         return None, {"reason": "invalid_json_response", "input_chars": input_chars, "items": len(items)}
 
+    source_by_id = {item["id"]: item["t"] for item in items}
     out_items = parsed.get("items", [])
     translated_by_id = {}
     for out_item in out_items:
@@ -731,6 +766,14 @@ def translate_structured_items_once(items, llm_options, batch_label=""):
         translated_text = (out_item.get("t") or "").strip()
         if not item_id or not translated_text:
             continue
+        source_text = source_by_id.get(item_id, "")
+        if source_text and has_verbatim_source_overlap(source_text, translated_text):
+            return None, {
+                "reason": "source_echo_detected",
+                "echo_item_id": item_id,
+                "input_chars": input_chars,
+                "items": len(items),
+            }
         if item_id in translated_by_id:
             return None, {"reason": "duplicate_id", "input_chars": input_chars, "items": len(items)}
         translated_by_id[item_id] = translated_text
@@ -930,6 +973,11 @@ def translate_with_lmstudio(llm_options, text, keep_markers=False, request_meta=
                 log_label=request_label,
             )
             if translated:
+                if has_verbatim_source_overlap(cleaned, translated):
+                    log_warn("LLM output included verbatim source English; retrying request.")
+                    translated = None
+                    time.sleep(0.5)
+                    continue
                 break
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError, Exception):
             time.sleep(0.5)
@@ -1740,6 +1788,17 @@ def build_default_output_pdf(source_pdf, engine="google"):
     return str(source_path.with_name(f"{source_path.stem}{suffix}.pdf"))
 
 
+def _count_json_items(json_path):
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if isinstance(payload, list):
+            return len(payload)
+    except Exception:
+        return None
+    return None
+
+
 def run_pipeline(source_pdf, output_pdf, translate_options):
     from extract import extract_pdf_text
     from generate import generate_translated_pdf
@@ -1748,6 +1807,8 @@ def run_pipeline(source_pdf, output_pdf, translate_options):
     if not source_path.exists():
         raise FileNotFoundError(f"Source PDF not found: {source_pdf}")
 
+    pipeline_started_at = time.time()
+
     engine = translate_options.get("engine", "google")
     output_pdf = output_pdf or build_default_output_pdf(source_pdf, engine=engine)
     extracted_json = str(source_path.with_name(f"{source_path.stem}_extracted_text.json"))
@@ -1755,21 +1816,45 @@ def run_pipeline(source_pdf, output_pdf, translate_options):
     segment_debug_json = str(source_path.with_name(f"{source_path.stem}_segment_debug.json"))
 
     log_info(f"[1/4] Extracting text blocks from: {source_pdf}")
+    extract_started_at = time.time()
     extract_pdf_text(str(source_path), extracted_json)
+    extract_elapsed = time.time() - extract_started_at
 
     engine_label = "LM Studio" if engine == "llm" else ("Google + LM Studio Hybrid" if engine == "hybrid" else "Google Translate")
     log_info(f"[2/4] Translating blocks to Japanese with {engine_label}")
+    translate_started_at = time.time()
     translate_blocks(
         extracted_json,
         translated_json,
         llm_options=translate_options,
         debug_json_path=segment_debug_json,
     )
+    translate_elapsed = time.time() - translate_started_at
 
     log_info(f"[3/4] Generating translated PDF: {output_pdf}")
+    generate_started_at = time.time()
     generate_translated_pdf(str(source_path), translated_json, output_pdf)
+    generate_elapsed = time.time() - generate_started_at
+
+    total_elapsed = time.time() - pipeline_started_at
+    extracted_blocks = _count_json_items(extracted_json)
+    translated_blocks = _count_json_items(translated_json)
 
     log_info("[4/4] Done.")
+    log_info(
+        "Pipeline summary: "
+        f"engine={engine} "
+        f"extracted_blocks={extracted_blocks if extracted_blocks is not None else 'n/a'} "
+        f"translated_blocks={translated_blocks if translated_blocks is not None else 'n/a'} "
+        f"output_pdf={output_pdf}"
+    )
+    log_info(
+        "Stage time: "
+        f"extract={format_elapsed(extract_elapsed)} "
+        f"translate={format_elapsed(translate_elapsed)} "
+        f"generate={format_elapsed(generate_elapsed)} "
+        f"total={format_elapsed(total_elapsed)}"
+    )
 
 
 if __name__ == "__main__":
