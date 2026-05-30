@@ -4,6 +4,7 @@ import math
 import os
 import re
 import time
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -13,6 +14,138 @@ from pathlib import Path
 BLOCK_MARKER_TEMPLATE = "__PDFTRANSLATE_BLOCK_{index}__"
 LMSTUDIO_DEFAULT_BASE_URL = "http://127.0.0.1:1234/v1"
 GOOGLE_TRANSLATE_DEFAULT_URL = "https://translate.googleapis.com/translate_a/single"
+
+_LLM_CALL_SEQ = 0
+_LLM_CALL_SEQ_LOCK = threading.Lock()
+
+_LLM_METRICS_LOCK = threading.Lock()
+_LLM_METRICS = {
+    "requests_total": 0,
+    "requests_ok": 0,
+    "requests_failed": 0,
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0,
+    "successful_elapsed": 0.0,
+}
+
+ANSI_RESET = "\033[0m"
+ANSI_INFO = "\033[96m"
+ANSI_WARN = "\033[93m"
+ANSI_ERROR = "\033[91m"
+
+
+def log_info(message):
+    print(f"{ANSI_INFO}[INFO]{ANSI_RESET} {message}", flush=True)
+
+
+def log_warn(message):
+    print(f"{ANSI_WARN}[WARN]{ANSI_RESET} {message}", flush=True)
+
+
+def log_error(message):
+    print(f"{ANSI_ERROR}[ERROR]{ANSI_RESET} {message}", flush=True)
+
+
+def next_llm_call_seq():
+    global _LLM_CALL_SEQ
+    with _LLM_CALL_SEQ_LOCK:
+        _LLM_CALL_SEQ += 1
+        return _LLM_CALL_SEQ
+
+
+def reset_llm_metrics():
+    with _LLM_METRICS_LOCK:
+        _LLM_METRICS["requests_total"] = 0
+        _LLM_METRICS["requests_ok"] = 0
+        _LLM_METRICS["requests_failed"] = 0
+        _LLM_METRICS["prompt_tokens"] = 0
+        _LLM_METRICS["completion_tokens"] = 0
+        _LLM_METRICS["total_tokens"] = 0
+        _LLM_METRICS["successful_elapsed"] = 0.0
+
+
+def _estimate_tokens_from_chars(char_count):
+    return max(0, int(math.ceil(max(0, char_count) / 4.0)))
+
+
+def _safe_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def record_llm_metrics(success, elapsed, prompt_chars=0, completion_chars=0, usage=None):
+    usage = usage if isinstance(usage, dict) else {}
+
+    prompt_tokens = _safe_int(usage.get("prompt_tokens"))
+    completion_tokens = _safe_int(usage.get("completion_tokens"))
+    total_tokens = _safe_int(usage.get("total_tokens"))
+
+    if prompt_tokens is None:
+        prompt_tokens = _estimate_tokens_from_chars(prompt_chars)
+    if completion_tokens is None:
+        completion_tokens = _estimate_tokens_from_chars(completion_chars)
+    if total_tokens is None:
+        total_tokens = prompt_tokens + completion_tokens
+
+    with _LLM_METRICS_LOCK:
+        _LLM_METRICS["requests_total"] += 1
+        if success:
+            _LLM_METRICS["requests_ok"] += 1
+            _LLM_METRICS["prompt_tokens"] += max(0, prompt_tokens)
+            _LLM_METRICS["completion_tokens"] += max(0, completion_tokens)
+            _LLM_METRICS["total_tokens"] += max(0, total_tokens)
+            _LLM_METRICS["successful_elapsed"] += max(0.0, float(elapsed))
+        else:
+            _LLM_METRICS["requests_failed"] += 1
+
+
+def snapshot_llm_metrics():
+    with _LLM_METRICS_LOCK:
+        return dict(_LLM_METRICS)
+
+
+def format_elapsed(seconds):
+    seconds = max(0.0, float(seconds))
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    remain = seconds - (minutes * 60)
+    return f"{minutes}m{remain:04.1f}s"
+
+
+def log_final_statistics(engine, started_at, translated_count):
+    total_elapsed = time.time() - started_at
+    log_info(f"Total processing time: {format_elapsed(total_elapsed)}")
+
+    if engine not in ("llm", "hybrid"):
+        return
+
+    metrics = snapshot_llm_metrics()
+    ok_elapsed = max(0.0, metrics.get("successful_elapsed", 0.0))
+    completion_tokens = int(metrics.get("completion_tokens", 0))
+    generation_tps = completion_tokens / ok_elapsed if ok_elapsed > 0 else 0.0
+    e2e_blocks_per_sec = translated_count / max(total_elapsed, 1e-6)
+
+    log_info(
+        "LLM stats: "
+        f"requests_total={metrics.get('requests_total', 0)} "
+        f"requests_ok={metrics.get('requests_ok', 0)} "
+        f"requests_failed={metrics.get('requests_failed', 0)}"
+    )
+    log_info(
+        "LLM tokens: "
+        f"prompt={metrics.get('prompt_tokens', 0)} "
+        f"completion={metrics.get('completion_tokens', 0)} "
+        f"total={metrics.get('total_tokens', 0)}"
+    )
+    log_info(
+        "Performance: "
+        f"generation={generation_tps:.2f} tok/s "
+        f"e2e_blocks={e2e_blocks_per_sec:.2f} blocks/s"
+    )
 
 
 def load_dotenv_file(env_path):
@@ -350,7 +483,84 @@ def build_naturalize_prompt(text):
     )
 
 
-def lmstudio_complete(base_url, model, prompt, temperature=0.2, timeout=120, max_tokens=4096):
+def build_structured_translate_prompt(payload_json):
+    return (
+        "You are a professional English-to-Japanese translator for business reports. "
+        "Translate each item's text into natural Japanese while preserving meaning. "
+        "Keep numbers, units, URLs, product names, model numbers, and proper nouns unchanged. "
+        "Return ONLY valid JSON with this exact shape: "
+        '{"items":[{"id":"<same id>","t":"<translated text>"}]} . '
+        "Do not add commentary, markdown fences, or extra keys. "
+        "Keep all item ids exactly as given and return one output item per input item.\n\n"
+        f"INPUT_JSON:\n{payload_json}"
+    )
+
+
+def format_request_log_label(request_meta):
+    if not request_meta:
+        return ""
+
+    ordered_keys = [
+        "mode",
+        "strategy",
+        "kind",
+        "items",
+        "chars",
+        "markers",
+        "page",
+        "block_idx",
+    ]
+    parts = []
+    for key in ordered_keys:
+        if key in request_meta and request_meta[key] is not None:
+            parts.append(f"{key}={request_meta[key]}")
+
+    for key, value in request_meta.items():
+        if key in ordered_keys or value is None:
+            continue
+        parts.append(f"{key}={value}")
+
+    if not parts:
+        return ""
+    return "req " + " ".join(parts)
+
+
+def _extract_http_error_detail(body_text):
+    raw = (body_text or "").strip()
+    if not raw:
+        return ""
+
+    parsed = None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        parsed = None
+
+    if isinstance(parsed, dict):
+        error_obj = parsed.get("error")
+        if isinstance(error_obj, dict):
+            message = str(error_obj.get("message") or "").strip()
+            code = str(error_obj.get("code") or "").strip()
+            err_type = str(error_obj.get("type") or "").strip()
+            detail_parts = [part for part in [message, code, err_type] if part]
+            if detail_parts:
+                return " | ".join(detail_parts)
+        for key in ["message", "detail", "error"]:
+            value = parsed.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    one_line = re.sub(r"\s+", " ", raw)
+    return one_line[:300]
+
+
+def lmstudio_complete(base_url, model, prompt, temperature=0.2, timeout=120, max_tokens=4096, log_label=""):
+    call_seq = next_llm_call_seq()
+    label = f" {log_label}" if log_label else ""
+    started_at = time.time()
+    prompt_chars = len(prompt)
+    log_info(f"[LLM call {call_seq}{label}] start prompt_chars={prompt_chars}")
+
     url = f"{base_url.rstrip('/')}/completions"
     payload = {
         "model": model,
@@ -366,15 +576,300 @@ def lmstudio_complete(base_url, model, prompt, temperature=0.2, timeout=120, max
         method="POST",
     )
 
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        body = response.read().decode("utf-8")
+    try:
+        if timeout is None or timeout <= 0:
+            with urllib.request.urlopen(req) as response:
+                body = response.read().decode("utf-8")
+        else:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        elapsed = time.time() - started_at
+        error_body = ""
+        try:
+            error_body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            error_body = ""
+
+        detail = _extract_http_error_detail(error_body)
+        status = getattr(exc, "code", "?")
+        reason = getattr(exc, "reason", "")
+        reason_text = f" {reason}" if reason else ""
+        if detail:
+            log_error(
+                f"[LLM call {call_seq}{label}] failed after {elapsed:.1f}s: "
+                f"HTTP {status}{reason_text} detail={detail}"
+            )
+        else:
+            log_error(
+                f"[LLM call {call_seq}{label}] failed after {elapsed:.1f}s: "
+                f"HTTP {status}{reason_text}"
+            )
+        record_llm_metrics(success=False, elapsed=elapsed, prompt_chars=prompt_chars, completion_chars=0, usage=None)
+        raise
+    except Exception as exc:
+        elapsed = time.time() - started_at
+        log_error(f"[LLM call {call_seq}{label}] failed after {elapsed:.1f}s: {type(exc).__name__}: {exc}")
+        record_llm_metrics(success=False, elapsed=elapsed, prompt_chars=prompt_chars, completion_chars=0, usage=None)
+        raise
 
     parsed = json.loads(body)
+    usage = parsed.get("usage") if isinstance(parsed, dict) else None
     choices = parsed.get("choices", [])
     if not choices:
+        elapsed = time.time() - started_at
+        log_warn(f"[LLM call {call_seq}{label}] done in {elapsed:.1f}s (empty choices)")
+        record_llm_metrics(success=True, elapsed=elapsed, prompt_chars=prompt_chars, completion_chars=0, usage=usage)
         return None
 
-    return (choices[0].get("text", "") or "").strip()
+    text = (choices[0].get("text", "") or "").strip()
+    elapsed = time.time() - started_at
+    log_info(f"[LLM call {call_seq}{label}] done in {elapsed:.1f}s response_chars={len(text)}")
+    record_llm_metrics(success=True, elapsed=elapsed, prompt_chars=prompt_chars, completion_chars=len(text), usage=usage)
+    return text
+
+
+def strip_json_fences(text):
+    cleaned = (text or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\\s*```$", "", cleaned)
+    return cleaned.strip()
+
+
+def parse_structured_translation_response(response_text):
+    cleaned = strip_json_fences(response_text)
+    if not cleaned:
+        return None
+
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        match = re.search(r"\{[\s\S]*\}", cleaned)
+        if not match:
+            return None
+        try:
+            parsed = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return None
+
+    if not isinstance(parsed, dict):
+        return None
+    items = parsed.get("items")
+    if not isinstance(items, list):
+        return None
+    return parsed
+
+
+def build_structured_translation_items(data):
+    ordered_blocks = sorted(data, key=lambda block: (block["page"], block.get("reading_order", block["block_idx"])))
+    items = []
+    for block in ordered_blocks:
+        text = block.get("text", "")
+        if is_page_number_or_code(text):
+            continue
+        normalized = normalize_for_translation(text, preserve_paragraph_break=True)
+        if not normalized:
+            continue
+        items.append(
+            {
+                "id": f"p{block['page']}_b{block['block_idx']}",
+                "p": block["page"],
+                "b": block["block_idx"],
+                "k": classify_block_kind(block),
+                "t": normalized,
+            }
+        )
+    return items
+
+
+def translate_structured_items_once(items, llm_options, batch_label=""):
+    input_chars = sum(len(item["t"]) for item in items)
+    payload_json = json.dumps({"items": items}, ensure_ascii=False, separators=(",", ":"))
+    prompt = build_structured_translate_prompt(payload_json)
+    request_label = format_request_log_label(
+        {
+            "mode": "document_batch",
+            "strategy": "structured_json",
+            "kind": "mixed",
+            "items": len(items),
+            "chars": input_chars,
+        }
+    )
+    combined_label = " ".join(part for part in [batch_label, request_label] if part)
+
+    response_text = None
+    for _ in range(3):
+        try:
+            response_text = lmstudio_complete(
+                base_url=llm_options["base_url"],
+                model=llm_options["model"],
+                prompt=prompt,
+                temperature=llm_options["temperature"],
+                timeout=llm_options["timeout"],
+                max_tokens=llm_options["max_tokens"],
+                log_label=combined_label,
+            )
+            if response_text:
+                break
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError, Exception):
+            time.sleep(0.5)
+
+    if not response_text:
+        return None, {"reason": "empty_response", "input_chars": input_chars, "items": len(items)}
+
+    parsed = parse_structured_translation_response(response_text)
+    if not parsed:
+        return None, {"reason": "invalid_json_response", "input_chars": input_chars, "items": len(items)}
+
+    out_items = parsed.get("items", [])
+    translated_by_id = {}
+    for out_item in out_items:
+        if not isinstance(out_item, dict):
+            continue
+        item_id = out_item.get("id")
+        translated_text = (out_item.get("t") or "").strip()
+        if not item_id or not translated_text:
+            continue
+        if item_id in translated_by_id:
+            return None, {"reason": "duplicate_id", "input_chars": input_chars, "items": len(items)}
+        translated_by_id[item_id] = translated_text
+
+    expected_ids = {item["id"] for item in items}
+    actual_ids = set(translated_by_id.keys())
+    if expected_ids != actual_ids:
+        return None, {
+            "reason": "id_mismatch",
+            "missing": len(expected_ids - actual_ids),
+            "extra": len(actual_ids - expected_ids),
+            "input_chars": input_chars,
+            "items": len(items),
+        }
+
+    return translated_by_id, {
+        "reason": "ok",
+        "input_chars": input_chars,
+        "items": len(items),
+        "response_chars": len(response_text),
+    }
+
+
+def translate_blocks_llm_structured_adaptive(data, llm_options, max_input_chars=180000, min_batch_items=8):
+    items = build_structured_translation_items(data)
+    if not items:
+        return None, {"used": False, "reason": "no_items"}
+
+    initial_chars = sum(len(item["t"]) for item in items)
+    translated_by_id = {}
+    split_events = 0
+    failed_leaf_batches = []
+    successful_batches = 0
+    configured_min_batch_items = max(1, int(min_batch_items))
+    index = 0
+
+    # Bottom-up adaptive sizing: start from 1 item, increase on success,
+    # and step back by one on failure to find stable throughput dynamically.
+    current_batch_size = 1
+    max_stable_batch_size = 1
+
+    while index < len(items):
+        remaining = len(items) - index
+        target_size = min(current_batch_size, remaining)
+
+        # Respect input size ceiling by shrinking this attempt before calling the model.
+        while target_size > 1:
+            trial_batch = items[index : index + target_size]
+            trial_chars = sum(len(item["t"]) for item in trial_batch)
+            if trial_chars <= max_input_chars:
+                break
+            target_size -= 1
+            split_events += 1
+            log_warn(f"[LLM batch] reduce by size limit target={target_size + 1}->{target_size} (max_chars={max_input_chars})")
+
+        batch = items[index : index + target_size]
+        batch_chars = sum(len(item["t"]) for item in batch)
+        log_info(f"[LLM batch] processing items={len(batch)} chars={batch_chars} index={index}/{len(items)} current_target={current_batch_size}")
+
+        translated_chunk, meta = translate_structured_items_once(
+            batch,
+            llm_options,
+            batch_label=f"batch items={len(batch)} chars={batch_chars}",
+        )
+        if translated_chunk is None:
+            failure_reason = meta.get("reason", "unknown")
+            if failure_reason == "empty_response":
+                log_warn(
+                    "[LLM batch] no usable response text returned (empty_response). "
+                    "Treating this as batch-too-large/unstable and retrying with smaller batches."
+                )
+
+            if len(batch) > 1:
+                previous_target = current_batch_size
+                current_batch_size = max(1, len(batch) - 1)
+                split_events += 1
+                log_warn(f"[LLM batch] reduce by failure({failure_reason}) target={previous_target}->{current_batch_size}")
+                continue
+
+            failed_leaf_batches.append({"items": len(batch), "chars": batch_chars, "reason": meta.get("reason", "unknown")})
+            log_error(f"[LLM batch] failed at minimum batch size items={len(batch)} reason={meta.get('reason', 'unknown')}")
+            return None, {
+                "used": False,
+                "reason": "batch_failure_at_min_size",
+                "initial_items": len(items),
+                "initial_chars": initial_chars,
+                "split_events": split_events,
+                "failed_leaf_batches": failed_leaf_batches,
+                "configured_min_batch_items": configured_min_batch_items,
+            }
+
+        translated_by_id.update(translated_chunk)
+        successful_batches += 1
+        index += len(batch)
+        max_stable_batch_size = max(max_stable_batch_size, len(batch))
+
+        previous_target = current_batch_size
+        current_batch_size = min(len(items), max_stable_batch_size + 1)
+        log_info(
+            f"[LLM batch] success items={len(batch)} successful_batches={successful_batches} split_events={split_events} next_target={current_batch_size} prev_target={previous_target}"
+        )
+
+    expected_ids = {item["id"] for item in items}
+    if set(translated_by_id.keys()) != expected_ids:
+        return None, {
+            "used": False,
+            "reason": "final_id_mismatch",
+            "initial_items": len(items),
+            "initial_chars": initial_chars,
+            "split_events": split_events,
+        }
+
+    results = []
+    for block in data:
+        block_copy = block.copy()
+        original_text = block.get("text", "")
+        block_copy["original_text"] = original_text
+        block_copy["segment_kind"] = classify_block_kind(block)
+
+        item_id = f"p{block['page']}_b{block['block_idx']}"
+        translated_text = translated_by_id.get(item_id)
+        if translated_text and not is_page_number_or_code(original_text):
+            block_copy["text"] = translated_text
+        else:
+            block_copy["text"] = original_text
+        results.append(block_copy)
+
+    return results, {
+        "used": True,
+        "reason": "ok",
+        "initial_items": len(items),
+        "initial_chars": initial_chars,
+        "split_events": split_events,
+        "successful_batches": successful_batches,
+        "min_batch_items": 1,
+        "configured_min_batch_items": configured_min_batch_items,
+        "max_stable_batch_size": max_stable_batch_size,
+        "max_input_chars": max_input_chars,
+    }
 
 
 def google_translate_text(text, timeout=30):
@@ -409,12 +904,19 @@ def google_translate_text(text, timeout=30):
     return translated or None
 
 
-def translate_with_lmstudio(llm_options, text, keep_markers=False):
+def translate_with_lmstudio(llm_options, text, keep_markers=False, request_meta=None):
     cleaned = text.strip()
     if not cleaned:
         return cleaned
 
     prompt = build_translate_prompt(cleaned, keep_markers=keep_markers)
+    effective_meta = dict(request_meta or {})
+    effective_meta.setdefault("chars", len(cleaned))
+    if keep_markers:
+        marker_count = len(re.findall(r"__PDFTRANSLATE_BLOCK_\d+__", cleaned))
+        effective_meta.setdefault("markers", marker_count)
+    request_label = format_request_log_label(effective_meta)
+
     translated = None
     for _ in range(3):
         try:
@@ -425,6 +927,7 @@ def translate_with_lmstudio(llm_options, text, keep_markers=False):
                 temperature=llm_options["temperature"],
                 timeout=llm_options["timeout"],
                 max_tokens=llm_options["max_tokens"],
+                log_label=request_label,
             )
             if translated:
                 break
@@ -762,7 +1265,19 @@ def translate_single_block(block, translate_options):
         translated_text = text
     else:
         normalized = normalize_for_translation(text, preserve_paragraph_break=False)
-        translated_text = translate_text(translate_options, normalized, keep_markers=False)
+        translated_text = translate_with_lmstudio(
+            translate_options["llm"],
+            normalized,
+            keep_markers=False,
+            request_meta={
+                "mode": "block",
+                "strategy": "single_block",
+                "kind": classify_block_kind(block),
+                "items": 1,
+                "page": block.get("page"),
+                "block_idx": block.get("block_idx"),
+            },
+        ) if translate_options.get("engine", "google") == "llm" else translate_text(translate_options, normalized, keep_markers=False)
         if not translated_text:
             translated_text = text
 
@@ -847,7 +1362,20 @@ def translate_paragraph_segment(segment, translate_options):
         return [translated_block], "single_paragraph"
 
     joined = "\n\n".join(normalize_for_translation(block["text"], preserve_paragraph_break=True) for block in blocks)
-    translated = translate_text(translate_options, joined, keep_markers=False)
+    if translate_options.get("engine", "google") == "llm":
+        translated = translate_with_lmstudio(
+            translate_options["llm"],
+            joined,
+            keep_markers=False,
+            request_meta={
+                "mode": "section",
+                "strategy": "paragraph_join",
+                "kind": "paragraph",
+                "items": len(blocks),
+            },
+        )
+    else:
+        translated = translate_text(translate_options, joined, keep_markers=False)
     if not translated:
         return None, "paragraph_translate_failed"
 
@@ -871,7 +1399,20 @@ def translate_structured_segment(segment, translate_options):
 
     blocks = segment["blocks"]
     payload = create_segment_payload(blocks)
-    translated_payload = translate_text(translate_options, payload, keep_markers=True)
+    if translate_options.get("engine", "google") == "llm":
+        translated_payload = translate_with_lmstudio(
+            translate_options["llm"],
+            payload,
+            keep_markers=True,
+            request_meta={
+                "mode": "section",
+                "strategy": "marker_payload",
+                "kind": segment.get("kind", "unknown"),
+                "items": len(blocks),
+            },
+        )
+    else:
+        translated_payload = translate_text(translate_options, payload, keep_markers=True)
     if translated_payload:
         split_result = split_translated_segment(translated_payload, len(blocks))
         if split_result is not None:
@@ -889,17 +1430,6 @@ def translate_structured_segment(segment, translate_options):
 def translate_segment(segment, index, llm_options):
     blocks = segment["blocks"]
     kind = segment["kind"]
-
-    if len(blocks) == 1 and kind != "paragraph":
-        translated_block = translate_single_block(blocks[0], llm_options)
-        return index, [translated_block], {
-            "kind": kind,
-            "strategy": "single_block",
-            "result": "single_block_direct",
-            "block_refs": [[blocks[0]["page"], blocks[0]["block_idx"]]],
-            "merge_reasons": segment.get("merge_reasons", []),
-            "source_preview": normalize_text(blocks[0]["text"])[:180],
-        }
 
     strategy = "structured"
     translated_blocks = None
@@ -929,20 +1459,206 @@ def translate_segment(segment, index, llm_options):
     }
 
 
+def _is_singleton_batch_candidate(segment):
+    return (
+        len(segment.get("blocks", [])) == 1
+        and segment.get("kind") in {"toc", "heading", "list"}
+    )
+
+
+def _segment_chars_for_batch(segment):
+    block = segment["blocks"][0]
+    return len(normalize_for_translation(block.get("text", ""), preserve_paragraph_break=False))
+
+
+def translate_segments_llm_adaptive(translation_segments, llm_options):
+    segment_slots = [None] * len(translation_segments)
+    segment_debug = [None] * len(translation_segments)
+
+    max_batch_items = max(2, int(llm_options.get("adaptive_singleton_max_items", 12)))
+    max_batch_chars = max(500, int(llm_options.get("adaptive_singleton_max_chars", 4500)))
+    current_target = 1
+    processed_segments = 0
+    started_at = time.time()
+
+    def log_progress():
+        if processed_segments % 10 == 0 or processed_segments == len(translation_segments):
+            elapsed = time.time() - started_at
+            log_info(
+                f"Processed {processed_segments}/{len(translation_segments)} segments... elapsed={format_elapsed(elapsed)}"
+            )
+
+    i = 0
+    while i < len(translation_segments):
+        segment = translation_segments[i]
+
+        if not _is_singleton_batch_candidate(segment):
+            idx, translated_segment, debug_info = translate_segment(segment, i, llm_options)
+            segment_slots[idx] = translated_segment
+            segment_debug[idx] = debug_info
+            processed_segments += 1
+            log_progress()
+            i += 1
+            continue
+
+        kind = segment["kind"]
+        run = []
+        j = i
+        while j < len(translation_segments):
+            next_segment = translation_segments[j]
+            if not _is_singleton_batch_candidate(next_segment) or next_segment["kind"] != kind:
+                break
+            run.append((j, next_segment))
+            j += 1
+
+        run_cursor = 0
+        while run_cursor < len(run):
+            remaining = len(run) - run_cursor
+            target = min(current_target, remaining, max_batch_items)
+
+            while target > 1:
+                candidate = [run[run_cursor + k][1] for k in range(target)]
+                candidate_chars = sum(_segment_chars_for_batch(seg) for seg in candidate)
+                if candidate_chars <= max_batch_chars:
+                    break
+                target -= 1
+
+            candidate = [run[run_cursor + k][1] for k in range(target)]
+            candidate_blocks = [seg["blocks"][0] for seg in candidate]
+            candidate_chars = sum(_segment_chars_for_batch(seg) for seg in candidate)
+            adaptive_segment = {
+                "kind": kind,
+                "blocks": candidate_blocks,
+                "merge_reasons": ["adaptive_singleton_batch"],
+            }
+
+            translated_blocks, result_note = translate_structured_segment(adaptive_segment, llm_options)
+            if translated_blocks is None or len(translated_blocks) != len(candidate_blocks):
+                if target > 1:
+                    previous = current_target
+                    current_target = max(1, target - 1)
+                    log_warn(
+                        f"[LLM adaptive] batch_failed kind={kind} items={target} chars={candidate_chars} "
+                        f"target={previous}->{current_target}"
+                    )
+                    continue
+
+                global_idx = run[run_cursor][0]
+                fallback_block = translate_single_block(run[run_cursor][1]["blocks"][0], llm_options)
+                segment_slots[global_idx] = [fallback_block]
+                segment_debug[global_idx] = {
+                    "kind": kind,
+                    "strategy": "single_block_fallback",
+                    "result": result_note,
+                    "block_refs": [[fallback_block["page"], fallback_block["block_idx"]]],
+                    "merge_reasons": ["adaptive_singleton_batch"],
+                    "source_preview": normalize_text(fallback_block["original_text"])[:180],
+                }
+                current_target = 1
+                run_cursor += 1
+                processed_segments += 1
+                log_progress()
+                continue
+
+            for offset, translated_block in enumerate(translated_blocks):
+                global_idx, original_segment = run[run_cursor + offset]
+                translated_block["segment_kind"] = kind
+                segment_slots[global_idx] = [translated_block]
+                source_block = original_segment["blocks"][0]
+                segment_debug[global_idx] = {
+                    "kind": kind,
+                    "strategy": "adaptive_marker_batch",
+                    "result": result_note,
+                    "block_refs": [[source_block["page"], source_block["block_idx"]]],
+                    "merge_reasons": ["adaptive_singleton_batch"],
+                    "source_preview": normalize_text(source_block["text"])[:180],
+                }
+
+            previous = current_target
+            current_target = min(max_batch_items, max(1, current_target + 1))
+            log_info(
+                f"[LLM adaptive] batch_ok kind={kind} items={len(candidate_blocks)} chars={candidate_chars} "
+                f"target={previous}->{current_target}"
+            )
+
+            run_cursor += len(candidate_blocks)
+            processed_segments += len(candidate_blocks)
+            log_progress()
+
+        i = j
+
+    return segment_slots, segment_debug
+
+
 def translate_blocks(input_json, output_json, llm_options, debug_json_path=None):
+    pipeline_started_at = time.time()
     with open(input_json, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    translation_segments = build_translation_segments(data)
     engine = llm_options.get("engine", "google")
+    if engine in ("llm", "hybrid"):
+        reset_llm_metrics()
+
+    translation_segments = build_translation_segments(data)
     engine_label = "LM Studio" if engine == "llm" else "Google Translate"
-    print(f"Starting {engine_label} translation of {len(data)} blocks in {len(translation_segments)} segments...", flush=True)
+
+    llm_single_call_info = None
+    if engine == "llm" and llm_options.get("llm_single_call", True):
+        log_info("Trying structured LLM translation with adaptive batch splitting...")
+        single_results, llm_single_call_info = translate_blocks_llm_structured_adaptive(
+            data,
+            llm_options=llm_options["llm"],
+            max_input_chars=max(1000, int(llm_options.get("llm_single_call_max_chars", 180000))),
+            min_batch_items=max(1, int(llm_options.get("llm_single_call_min_batch_items", 8))),
+        )
+        if single_results is not None:
+            translated_count = sum(
+                1
+                for block in single_results
+                if block.get("text") != block.get("original_text") and not is_page_number_or_code(block.get("original_text", ""))
+            )
+            with open(output_json, "w", encoding="utf-8") as f:
+                json.dump(single_results, f, ensure_ascii=False, indent=2)
+
+            if debug_json_path:
+                debug_payload = {
+                    "segment_debug": [],
+                    "engine": engine,
+                    "workers": 1,
+                    "llm": {
+                        "provider": "lmstudio",
+                        "model": llm_options["llm"]["model"],
+                        "base_url": llm_options["llm"]["base_url"],
+                        "temperature": llm_options["llm"]["temperature"],
+                        "max_tokens": llm_options["llm"]["max_tokens"],
+                        "max_workers": 1,
+                    },
+                    "llm_single_call": llm_single_call_info,
+                }
+                with open(debug_json_path, "w", encoding="utf-8") as f:
+                    json.dump(debug_payload, f, ensure_ascii=False, indent=2)
+
+            log_info(
+                "Structured translation completed: "
+                f"initial_items={llm_single_call_info.get('initial_items')}, "
+                f"split_events={llm_single_call_info.get('split_events')}, "
+                f"successful_batches={llm_single_call_info.get('successful_batches')}"
+            )
+            log_info(f"Completed translation! Saved to {output_json}. Total translated: {translated_count}")
+            log_final_statistics(engine=engine, started_at=pipeline_started_at, translated_count=translated_count)
+            return
+
+        reason = llm_single_call_info.get("reason") if isinstance(llm_single_call_info, dict) else "unknown"
+        log_warn(f"Single-call structured translation skipped/fallback: {reason}")
+
+    log_info(f"Starting {engine_label} translation of {len(data)} blocks in {len(translation_segments)} segments...")
 
     translated_count = 0
     segment_slots = [None] * len(translation_segments)
     segment_debug = [None] * len(translation_segments)
 
     max_workers = max(1, int(llm_options.get("max_workers", 1)))
+    processing_started_at = time.time()
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(translate_segment, segment, idx, llm_options): idx
@@ -956,19 +1672,19 @@ def translate_blocks(input_json, output_json, llm_options, debug_json_path=None)
 
             processed_segments = sum(1 for segment in segment_slots if segment is not None)
             if processed_segments % 10 == 0 or processed_segments == len(translation_segments):
-                print(
-                    f"Processed {processed_segments}/{len(translation_segments)} segments...",
-                    flush=True,
+                elapsed = time.time() - processing_started_at
+                log_info(
+                    f"Processed {processed_segments}/{len(translation_segments)} segments... "
+                    f"elapsed={format_elapsed(elapsed)}"
                 )
 
     hybrid_summary = None
     if engine == "hybrid":
-        print("Starting hybrid naturalization pass with LM Studio...", flush=True)
+        log_info("Starting hybrid naturalization pass with LM Studio...")
         hybrid_summary = run_hybrid_refinement(translation_segments, segment_slots, segment_debug, llm_options)
-        print(
+        log_info(
             "Hybrid naturalization completed: "
-            f"selected={hybrid_summary['selected']}, updated={hybrid_summary['updated']}, skipped={hybrid_summary['skipped']}",
-            flush=True,
+            f"selected={hybrid_summary['selected']}, updated={hybrid_summary['updated']}, skipped={hybrid_summary['skipped']}"
         )
 
     translated_blocks = []
@@ -1002,12 +1718,15 @@ def translate_blocks(input_json, output_json, llm_options, debug_json_path=None)
                 "max_tokens": llm_cfg["max_tokens"],
                 "max_workers": max_workers,
             }
+        if llm_single_call_info is not None:
+            debug_payload["llm_single_call"] = llm_single_call_info
         if hybrid_summary is not None:
             debug_payload["hybrid"] = hybrid_summary
         with open(debug_json_path, "w", encoding="utf-8") as f:
             json.dump(debug_payload, f, ensure_ascii=False, indent=2)
 
-    print(f"Completed translation! Saved to {output_json}. Total translated: {translated_count}", flush=True)
+    log_info(f"Completed translation! Saved to {output_json}. Total translated: {translated_count}")
+    log_final_statistics(engine=engine, started_at=pipeline_started_at, translated_count=translated_count)
 
 
 def build_default_output_pdf(source_pdf, engine="google"):
@@ -1035,11 +1754,11 @@ def run_pipeline(source_pdf, output_pdf, translate_options):
     translated_json = str(source_path.with_name(f"{source_path.stem}_translated_text.json"))
     segment_debug_json = str(source_path.with_name(f"{source_path.stem}_segment_debug.json"))
 
-    print(f"[1/4] Extracting text blocks from: {source_pdf}", flush=True)
+    log_info(f"[1/4] Extracting text blocks from: {source_pdf}")
     extract_pdf_text(str(source_path), extracted_json)
 
     engine_label = "LM Studio" if engine == "llm" else ("Google + LM Studio Hybrid" if engine == "hybrid" else "Google Translate")
-    print(f"[2/4] Translating blocks to Japanese with {engine_label}", flush=True)
+    log_info(f"[2/4] Translating blocks to Japanese with {engine_label}")
     translate_blocks(
         extracted_json,
         translated_json,
@@ -1047,10 +1766,10 @@ def run_pipeline(source_pdf, output_pdf, translate_options):
         debug_json_path=segment_debug_json,
     )
 
-    print(f"[3/4] Generating translated PDF: {output_pdf}", flush=True)
+    log_info(f"[3/4] Generating translated PDF: {output_pdf}")
     generate_translated_pdf(str(source_path), translated_json, output_pdf)
 
-    print("[4/4] Done.", flush=True)
+    log_info("[4/4] Done.")
 
 
 if __name__ == "__main__":
@@ -1082,8 +1801,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--lmstudio-timeout",
         type=int,
-        default=int(os.environ.get("LMSTUDIO_TIMEOUT", "120")),
-        help="LM Studio HTTP timeout seconds",
+        default=int(os.environ.get("LMSTUDIO_TIMEOUT", "0")),
+        help="LM Studio HTTP timeout seconds (<=0 disables forced timeout)",
     )
     parser.add_argument(
         "--lmstudio-max-tokens",
@@ -1102,6 +1821,24 @@ if __name__ == "__main__":
         type=int,
         default=int(os.environ.get("LMSTUDIO_MAX_WORKERS", "8")),
         help="Concurrent translation workers",
+    )
+    parser.add_argument(
+        "--llm-single-call",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("LLM_SINGLE_CALL", "1") not in ("0", "false", "False"),
+        help="Try one structured LLM API call for full-document translation before segmented fallback (llm engine only)",
+    )
+    parser.add_argument(
+        "--llm-single-call-max-chars",
+        type=int,
+        default=int(os.environ.get("LLM_SINGLE_CALL_MAX_CHARS", "180000")),
+        help="Maximum total input characters per structured LLM batch",
+    )
+    parser.add_argument(
+        "--llm-single-call-min-batch-items",
+        type=int,
+        default=int(os.environ.get("LLM_SINGLE_CALL_MIN_BATCH_ITEMS", "8")),
+        help="Minimum batch size when adaptive structured LLM batching retries with smaller batches",
     )
     parser.add_argument(
         "--google-timeout",
@@ -1145,12 +1882,15 @@ if __name__ == "__main__":
         explicit_env_file=args.env_file,
     )
     if loaded_count > 0:
-        print(f"Loaded {loaded_count} env vars from: {', '.join(loaded_files)}", flush=True)
+        log_info(f"Loaded {loaded_count} env vars from: {', '.join(loaded_files)}")
 
     translate_options = {
         "engine": args.engine,
         "google_timeout": args.google_timeout,
         "max_workers": args.lmstudio_max_workers,
+        "llm_single_call": args.llm_single_call,
+        "llm_single_call_max_chars": args.llm_single_call_max_chars,
+        "llm_single_call_min_batch_items": args.llm_single_call_min_batch_items,
         "hybrid_max_segments": args.hybrid_max_segments,
         "hybrid_min_chars": args.hybrid_min_chars,
         "hybrid_min_score": args.hybrid_min_score,
