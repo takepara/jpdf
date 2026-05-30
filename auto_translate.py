@@ -178,8 +178,9 @@ def load_dotenv_file(env_path):
             ):
                 value = value[1:-1]
 
-            if key not in os.environ:
-                os.environ[key] = value
+            previous = os.environ.get(key)
+            os.environ[key] = value
+            if previous != value:
                 loaded += 1
 
     return loaded
@@ -498,18 +499,21 @@ def build_structured_translate_prompt(payload_json):
     )
 
 
-def has_verbatim_source_overlap(source_text, output_text, min_source_chars=40, min_words=12):
+def detect_verbatim_source_overlap(source_text, output_text, min_source_chars=80, min_words=16):
     source = normalize_text(source_text)
     output = normalize_text(output_text)
     if not source or not output:
-        return False
+        return False, None
 
     source_lower = source.lower()
     output_lower = output.lower()
 
     # Direct full-source echo.
     if len(source_lower) >= min_source_chars and source_lower in output_lower:
-        return True
+        return True, {
+            "rule": "full_source",
+            "match": source[:200],
+        }
 
     # Sentence-level echo for long English clauses.
     sentence_candidates = [
@@ -520,17 +524,35 @@ def has_verbatim_source_overlap(source_text, output_text, min_source_chars=40, m
     for candidate in sentence_candidates:
         words = re.findall(r"[A-Za-z][A-Za-z0-9'\-/]*", candidate)
         if len(words) >= min_words and candidate.lower() in output_lower:
-            return True
+            return True, {
+                "rule": "sentence_phrase",
+                "match": candidate[:200],
+                "words": len(words),
+            }
 
     # Sliding window over English tokens to detect long phrase reuse.
     english_tokens = re.findall(r"[A-Za-z][A-Za-z0-9'\-/]*", source)
     if len(english_tokens) >= min_words:
         for start in range(0, len(english_tokens) - min_words + 1):
-            phrase = " ".join(english_tokens[start : start + min_words]).lower()
-            if phrase in output_lower:
-                return True
+            phrase = " ".join(english_tokens[start : start + min_words])
+            if phrase.lower() in output_lower:
+                return True, {
+                    "rule": "sliding_window",
+                    "match": phrase[:200],
+                    "words": min_words,
+                }
 
-    return False
+    return False, None
+
+
+def has_verbatim_source_overlap(source_text, output_text, min_source_chars=80, min_words=16):
+    detected, _ = detect_verbatim_source_overlap(
+        source_text,
+        output_text,
+        min_source_chars=min_source_chars,
+        min_words=min_words,
+    )
+    return detected
 
 
 def format_request_log_label(request_meta):
@@ -591,20 +613,74 @@ def _extract_http_error_detail(body_text):
     return one_line[:300]
 
 
-def lmstudio_complete(base_url, model, prompt, temperature=0.2, timeout=120, max_tokens=4096, log_label=""):
+def structured_items_response_format():
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "translation_items",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["items"],
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["id", "t"],
+                            "properties": {
+                                "id": {"type": "string"},
+                                "t": {"type": "string"},
+                            },
+                        },
+                    }
+                },
+            },
+        },
+    }
+
+
+def lmstudio_complete(
+    base_url,
+    model,
+    prompt,
+    temperature=0.2,
+    timeout=120,
+    max_tokens=4096,
+    log_label="",
+    response_format=None,
+    allow_response_format_fallback=True,
+):
     call_seq = next_llm_call_seq()
     label = f" {log_label}" if log_label else ""
     started_at = time.time()
     prompt_chars = len(prompt)
     log_info(f"[LLM call {call_seq}{label}] start prompt_chars={prompt_chars}")
 
-    url = f"{base_url.rstrip('/')}/completions"
+    url = f"{base_url.rstrip('/')}/chat/completions"
     payload = {
         "model": model,
-        "prompt": prompt,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "source_lang_code": "en",
+                        "target_lang_code": "ja",
+                        "text": prompt,
+                        "image": None,
+                    }
+                ],
+            }
+        ],
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+    if response_format is not None:
+        payload["response_format"] = response_format
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -632,6 +708,24 @@ def lmstudio_complete(base_url, model, prompt, temperature=0.2, timeout=120, max
         status = getattr(exc, "code", "?")
         reason = getattr(exc, "reason", "")
         reason_text = f" {reason}" if reason else ""
+
+        if response_format is not None and allow_response_format_fallback and status in (400, 404, 422):
+            log_warn(
+                f"[LLM call {call_seq}{label}] response_format rejected by server "
+                f"(HTTP {status}); retrying without response_format"
+            )
+            return lmstudio_complete(
+                base_url=base_url,
+                model=model,
+                prompt=prompt,
+                temperature=temperature,
+                timeout=timeout,
+                max_tokens=max_tokens,
+                log_label=log_label,
+                response_format=None,
+                allow_response_format_fallback=False,
+            )
+
         if detail:
             log_error(
                 f"[LLM call {call_seq}{label}] failed after {elapsed:.1f}s: "
@@ -659,7 +753,23 @@ def lmstudio_complete(base_url, model, prompt, temperature=0.2, timeout=120, max
         record_llm_metrics(success=True, elapsed=elapsed, prompt_chars=prompt_chars, completion_chars=0, usage=usage)
         return None
 
-    text = (choices[0].get("text", "") or "").strip()
+    first_choice = choices[0] if isinstance(choices[0], dict) else {}
+    message = first_choice.get("message") if isinstance(first_choice, dict) else None
+    content = ""
+    if isinstance(message, dict):
+        content = message.get("content", "") or ""
+    elif isinstance(first_choice.get("text"), str):
+        # Compatibility fallback for servers that still return text-completion shape.
+        content = first_choice.get("text", "") or ""
+
+    if isinstance(content, list):
+        content = "".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict)
+        )
+
+    text = content.strip()
     elapsed = time.time() - started_at
     log_info(f"[LLM call {call_seq}{label}] done in {elapsed:.1f}s response_chars={len(text)}")
     record_llm_metrics(success=True, elapsed=elapsed, prompt_chars=prompt_chars, completion_chars=len(text), usage=usage)
@@ -674,6 +784,64 @@ def strip_json_fences(text):
     return cleaned.strip()
 
 
+def extract_first_json_object(text):
+    raw = text or ""
+    start = raw.find("{")
+    if start < 0:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for idx in range(start, len(raw)):
+        ch = raw[idx]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            depth += 1
+            continue
+        if ch == "}":
+            depth -= 1
+            if depth == 0:
+                return raw[start : idx + 1]
+
+    return None
+
+
+def normalize_structured_items(parsed):
+    if not isinstance(parsed, dict):
+        return None
+    items = parsed.get("items")
+    if not isinstance(items, list):
+        return None
+
+    normalized_items = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_id = item.get("id")
+        text = item.get("t")
+        if not isinstance(item_id, str) or not isinstance(text, str):
+            continue
+        item_id = item_id.strip()
+        text = text.strip()
+        if not item_id or not text:
+            continue
+        normalized_items.append({"id": item_id, "t": text})
+
+    return {"items": normalized_items}
+
+
 def parse_structured_translation_response(response_text):
     cleaned = strip_json_fences(response_text)
     if not cleaned:
@@ -682,20 +850,28 @@ def parse_structured_translation_response(response_text):
     try:
         parsed = json.loads(cleaned)
     except json.JSONDecodeError:
-        match = re.search(r"\{[\s\S]*\}", cleaned)
-        if not match:
+        first_obj = extract_first_json_object(cleaned)
+        if not first_obj:
             return None
         try:
-            parsed = json.loads(match.group(0))
+            parsed = json.loads(first_obj)
         except json.JSONDecodeError:
             return None
 
-    if not isinstance(parsed, dict):
-        return None
-    items = parsed.get("items")
-    if not isinstance(items, list):
-        return None
-    return parsed
+    return normalize_structured_items(parsed)
+
+
+def build_json_repair_prompt(raw_response_text, expected_items_count):
+    cleaned = (raw_response_text or "").strip()
+    return (
+        "Convert the following model output into strict valid JSON only. "
+        "Return exactly one JSON object with shape: "
+        '{"items":[{"id":"<same id>","t":"<translated text>"}]}. '
+        "Do not add explanations, markdown, or extra keys. "
+        f"Expected number of items: {expected_items_count}.\n\n"
+        "MODEL_OUTPUT:\n"
+        f"{cleaned}"
+    )
 
 
 def build_structured_translation_items(data):
@@ -717,19 +893,35 @@ def build_structured_translation_items(data):
     return items
 
 
-def translate_structured_items_once(items, llm_options, batch_label=""):
+def build_structured_request_payload(items):
     input_chars = sum(len(item["t"]) for item in items)
     payload_json = json.dumps({"items": items}, ensure_ascii=False, separators=(",", ":"))
     prompt = build_structured_translate_prompt(payload_json)
-    request_label = format_request_log_label(
-        {
-            "mode": "document_batch",
-            "strategy": "structured_json",
-            "kind": "mixed",
-            "items": len(items),
-            "chars": input_chars,
-        }
-    )
+    prompt_chars = len(prompt)
+    return {
+        "input_chars": input_chars,
+        "payload_json": payload_json,
+        "payload_chars": len(payload_json),
+        "prompt": prompt,
+        "prompt_chars": prompt_chars,
+        "estimated_prompt_tokens": _estimate_tokens_from_chars(prompt_chars),
+    }
+
+
+def translate_structured_items_once(items, llm_options, batch_label="", request_meta=None):
+    request_payload = build_structured_request_payload(items)
+    input_chars = request_payload["input_chars"]
+    prompt = request_payload["prompt"]
+    effective_meta = {
+        "mode": "document_batch",
+        "strategy": "structured_json",
+        "kind": "mixed",
+        "items": len(items),
+        "chars": input_chars,
+    }
+    if isinstance(request_meta, dict):
+        effective_meta.update({key: value for key, value in request_meta.items() if value is not None})
+    request_label = format_request_log_label(effective_meta)
     combined_label = " ".join(part for part in [batch_label, request_label] if part)
 
     response_text = None
@@ -743,6 +935,7 @@ def translate_structured_items_once(items, llm_options, batch_label=""):
                 timeout=llm_options["timeout"],
                 max_tokens=llm_options["max_tokens"],
                 log_label=combined_label,
+                response_format=structured_items_response_format(),
             )
             if response_text:
                 break
@@ -754,11 +947,35 @@ def translate_structured_items_once(items, llm_options, batch_label=""):
 
     parsed = parse_structured_translation_response(response_text)
     if not parsed:
-        return None, {"reason": "invalid_json_response", "input_chars": input_chars, "items": len(items)}
+        repair_prompt = build_json_repair_prompt(response_text, expected_items_count=len(items))
+        repaired_response = None
+        try:
+            repaired_response = lmstudio_complete(
+                base_url=llm_options["base_url"],
+                model=llm_options["model"],
+                prompt=repair_prompt,
+                temperature=min(0.1, float(llm_options.get("temperature", 0.2))),
+                timeout=llm_options["timeout"],
+                max_tokens=llm_options["max_tokens"],
+                log_label=f"{combined_label} repair_json",
+                response_format=structured_items_response_format(),
+            )
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError, Exception):
+            repaired_response = None
+
+        parsed = parse_structured_translation_response(repaired_response)
+        if not parsed:
+            return None, {
+                "reason": "invalid_json_response",
+                "input_chars": input_chars,
+                "items": len(items),
+                "response_preview": (response_text or "")[:400],
+            }
 
     source_by_id = {item["id"]: item["t"] for item in items}
     out_items = parsed.get("items", [])
     translated_by_id = {}
+    echo_warnings = []
     for out_item in out_items:
         if not isinstance(out_item, dict):
             continue
@@ -767,13 +984,21 @@ def translate_structured_items_once(items, llm_options, batch_label=""):
         if not item_id or not translated_text:
             continue
         source_text = source_by_id.get(item_id, "")
-        if source_text and has_verbatim_source_overlap(source_text, translated_text):
-            return None, {
-                "reason": "source_echo_detected",
-                "echo_item_id": item_id,
-                "input_chars": input_chars,
-                "items": len(items),
-            }
+        detected_echo, echo_detail = detect_verbatim_source_overlap(source_text, translated_text)
+        if source_text and detected_echo:
+            rule = (echo_detail or {}).get("rule", "unknown")
+            match = (echo_detail or {}).get("match", "")
+            echo_warnings.append(
+                {
+                    "item_id": item_id,
+                    "rule": rule,
+                    "match": match,
+                }
+            )
+            log_warn(
+                "source_echo_detected (continuing): "
+                f"item_id={item_id} rule={rule} match={match[:140]}"
+            )
         if item_id in translated_by_id:
             return None, {"reason": "duplicate_id", "input_chars": input_chars, "items": len(items)}
         translated_by_id[item_id] = translated_text
@@ -790,101 +1015,246 @@ def translate_structured_items_once(items, llm_options, batch_label=""):
         }
 
     return translated_by_id, {
-        "reason": "ok",
+        "reason": "ok_with_warnings" if echo_warnings else "ok",
         "input_chars": input_chars,
         "items": len(items),
         "response_chars": len(response_text),
+        "echo_warnings": echo_warnings,
     }
 
 
-def translate_blocks_llm_structured_adaptive(data, llm_options, max_input_chars=180000, min_batch_items=8):
-    items = build_structured_translation_items(data)
-    if not items:
+def build_structured_translation_items_by_page(data):
+    ordered_blocks = sorted(data, key=lambda block: (block["page"], block.get("reading_order", block["block_idx"])))
+    page_map = {}
+    for block in ordered_blocks:
+        text = block.get("text", "")
+        if is_page_number_or_code(text):
+            continue
+        normalized = normalize_for_translation(text, preserve_paragraph_break=True)
+        if not normalized:
+            continue
+
+        page = block["page"]
+        page_items = page_map.setdefault(page, [])
+        page_items.append(
+            {
+                "id": f"p{block['page']}_b{block['block_idx']}",
+                "t": normalized,
+            }
+        )
+
+    return [(page, page_map[page]) for page in sorted(page_map.keys())]
+
+
+def collect_page_request_stats(data, llm_options, max_input_chars=70000):
+    page_items = build_structured_translation_items_by_page(data)
+    max_tokens = int(llm_options.get("max_tokens", 4096))
+
+    stats = []
+    for page, items in page_items:
+        request_payload = build_structured_request_payload(items)
+        prompt_tokens = request_payload["estimated_prompt_tokens"]
+        estimated_total_tokens = prompt_tokens + max_tokens
+        stats.append(
+            {
+                "page": page,
+                "items": len(items),
+                "input_chars": request_payload["input_chars"],
+                "payload_chars": request_payload["payload_chars"],
+                "prompt_chars": request_payload["prompt_chars"],
+                "estimated_prompt_tokens": prompt_tokens,
+                "max_output_tokens": max_tokens,
+                "estimated_total_tokens": estimated_total_tokens,
+                "over_input_char_limit": request_payload["input_chars"] > max_input_chars,
+                "max_input_chars": max_input_chars,
+            }
+        )
+
+    return stats
+
+
+def build_page_failure_message(page_info, llm_options):
+    info = page_info if isinstance(page_info, dict) else {}
+    reason = info.get("reason", "unknown")
+    page = info.get("page")
+    max_input_chars = int(info.get("max_input_chars", 0) or 0)
+    configured_max_tokens = int(llm_options.get("max_tokens", 0) or 0)
+
+    lines = ["Page-wise LLM translation failed and fallback is disabled."]
+    lines.append(f"reason={reason}")
+    if page is not None:
+        lines.append(f"page={page}")
+
+    if reason == "page_too_large":
+        lines.append(f"input_chars={info.get('input_chars')} max_input_chars={max_input_chars}")
+        lines.append("resolution:")
+        lines.append(f"- Lower per-page payload size: set LLM_PAGE_MAX_CHARS below {max_input_chars} and retry.")
+        lines.append("- Enable page-internal split implementation (split one page into multiple API calls).")
+        if configured_max_tokens > 0:
+            lines.append(f"- Reduce LMSTUDIO_MAX_TOKENS from {configured_max_tokens} to 1024 or 768.")
+    elif reason == "page_batch_failed":
+        meta = info.get("meta") if isinstance(info.get("meta"), dict) else {}
+        lines.append(f"api_meta_reason={meta.get('reason', 'unknown')}")
+        if meta.get("reason") == "source_echo_detected":
+            if meta.get("echo_item_id"):
+                lines.append(f"echo_item_id={meta.get('echo_item_id')}")
+            if meta.get("echo_rule"):
+                lines.append(f"echo_rule={meta.get('echo_rule')}")
+            if meta.get("echo_match"):
+                lines.append(f"echo_match={str(meta.get('echo_match'))[:200]}")
+        if "input_chars" in meta:
+            lines.append(f"input_chars={meta.get('input_chars')}")
+        if "items" in meta:
+            lines.append(f"items={meta.get('items')}")
+        lines.append("resolution:")
+        lines.append("- Keep page mode and retry with smaller payload: LLM_PAGE_MAX_CHARS=12000 (or 8000).")
+        if configured_max_tokens > 0:
+            lines.append(f"- Reduce LMSTUDIO_MAX_TOKENS from {configured_max_tokens} to 1024 or 768.")
+        lines.append("- Confirm LM Studio server model/context settings for API endpoint /v1/chat/completions.")
+    else:
+        lines.append("resolution:")
+        lines.append("- Retry with LLM_PAGE_MAX_CHARS=12000 and LMSTUDIO_MAX_TOKENS=1024.")
+        lines.append("- Check LM Studio server logs for request rejection details.")
+
+    return "\n".join(lines)
+
+
+def translate_blocks_llm_page_mode(data, llm_options, max_input_chars=70000, max_workers=1):
+    page_items = build_structured_translation_items_by_page(data)
+    if not page_items:
         return None, {"used": False, "reason": "no_items"}
 
-    initial_chars = sum(len(item["t"]) for item in items)
     translated_by_id = {}
-    split_events = 0
-    failed_leaf_batches = []
-    successful_batches = 0
-    configured_min_batch_items = max(1, int(min_batch_items))
-    index = 0
+    page_summaries = []
+    max_output_tokens = int(llm_options.get("max_tokens", 4096))
 
-    # Bottom-up adaptive sizing: start from 1 item, increase on success,
-    # and step back by one on failure to find stable throughput dynamically.
-    current_batch_size = 1
-    max_stable_batch_size = 1
-
-    while index < len(items):
-        remaining = len(items) - index
-        target_size = min(current_batch_size, remaining)
-
-        # Respect input size ceiling by shrinking this attempt before calling the model.
-        while target_size > 1:
-            trial_batch = items[index : index + target_size]
-            trial_chars = sum(len(item["t"]) for item in trial_batch)
-            if trial_chars <= max_input_chars:
-                break
-            target_size -= 1
-            split_events += 1
-            log_warn(f"[LLM batch] reduce by size limit target={target_size + 1}->{target_size} (max_chars={max_input_chars})")
-
-        batch = items[index : index + target_size]
-        batch_chars = sum(len(item["t"]) for item in batch)
-        log_info(f"[LLM batch] processing items={len(batch)} chars={batch_chars} index={index}/{len(items)} current_target={current_batch_size}")
-
-        translated_chunk, meta = translate_structured_items_once(
-            batch,
-            llm_options,
-            batch_label=f"batch items={len(batch)} chars={batch_chars}",
+    prepared_pages = []
+    for page, items in page_items:
+        request_payload = build_structured_request_payload(items)
+        input_chars = request_payload["input_chars"]
+        log_info(
+            "[LLM page] "
+            f"page={page} items={len(items)} "
+            f"input_chars={input_chars} payload_chars={request_payload['payload_chars']} "
+            f"prompt_chars={request_payload['prompt_chars']} est_prompt_tokens={request_payload['estimated_prompt_tokens']} "
+            f"max_output_tokens={max_output_tokens} est_total_tokens={request_payload['estimated_prompt_tokens'] + max_output_tokens}"
         )
-        if translated_chunk is None:
-            failure_reason = meta.get("reason", "unknown")
-            if failure_reason == "empty_response":
-                log_warn(
-                    "[LLM batch] no usable response text returned (empty_response). "
-                    "Treating this as batch-too-large/unstable and retrying with smaller batches."
-                )
-
-            if len(batch) > 1:
-                previous_target = current_batch_size
-                current_batch_size = max(1, len(batch) - 1)
-                split_events += 1
-                log_warn(f"[LLM batch] reduce by failure({failure_reason}) target={previous_target}->{current_batch_size}")
-                continue
-
-            failed_leaf_batches.append({"items": len(batch), "chars": batch_chars, "reason": meta.get("reason", "unknown")})
-            log_error(f"[LLM batch] failed at minimum batch size items={len(batch)} reason={meta.get('reason', 'unknown')}")
+        if input_chars > max_input_chars:
             return None, {
                 "used": False,
-                "reason": "batch_failure_at_min_size",
-                "initial_items": len(items),
-                "initial_chars": initial_chars,
-                "split_events": split_events,
-                "failed_leaf_batches": failed_leaf_batches,
-                "configured_min_batch_items": configured_min_batch_items,
+                "reason": "page_too_large",
+                "page": page,
+                "input_chars": input_chars,
+                "max_input_chars": max_input_chars,
+                "items": len(items),
             }
-
-        translated_by_id.update(translated_chunk)
-        successful_batches += 1
-        index += len(batch)
-        max_stable_batch_size = max(max_stable_batch_size, len(batch))
-
-        previous_target = current_batch_size
-        current_batch_size = min(len(items), max_stable_batch_size + 1)
-        log_info(
-            f"[LLM batch] success items={len(batch)} successful_batches={successful_batches} split_events={split_events} next_target={current_batch_size} prev_target={previous_target}"
+        prepared_pages.append(
+            {
+                "page": page,
+                "items": items,
+                "request_payload": request_payload,
+                "input_chars": input_chars,
+            }
         )
 
-    expected_ids = {item["id"] for item in items}
-    if set(translated_by_id.keys()) != expected_ids:
-        return None, {
-            "used": False,
-            "reason": "final_id_mismatch",
-            "initial_items": len(items),
-            "initial_chars": initial_chars,
-            "split_events": split_events,
-        }
+    max_workers = max(1, int(max_workers))
+    if max_workers > 1:
+        log_info(f"[LLM page] parallel mode enabled workers={max_workers}")
+
+    def process_page(prepared):
+        page = prepared["page"]
+        items = prepared["items"]
+        input_chars = prepared["input_chars"]
+        translated_chunk, meta = translate_structured_items_once(
+            items,
+            llm_options,
+            batch_label=f"page={page} items={len(items)} chars={input_chars}",
+            request_meta={
+                "mode": "page_batch",
+                "strategy": "structured_json",
+                "kind": "mixed",
+                "page": page,
+                "items": len(items),
+                "chars": input_chars,
+            },
+        )
+        return page, translated_chunk, meta
+
+    if max_workers == 1:
+        for prepared in prepared_pages:
+            page, translated_chunk, meta = process_page(prepared)
+            if translated_chunk is None:
+                return None, {
+                    "used": False,
+                    "reason": "page_batch_failed",
+                    "page": page,
+                    "meta": meta,
+                    "pages_done": len(page_summaries),
+                    "pages_total": len(prepared_pages),
+                }
+
+            translated_by_id.update(translated_chunk)
+            request_payload = prepared["request_payload"]
+            page_summaries.append(
+                {
+                    "page": page,
+                    "items": len(prepared["items"]),
+                    "input_chars": prepared["input_chars"],
+                    "payload_chars": request_payload["payload_chars"],
+                    "prompt_chars": request_payload["prompt_chars"],
+                    "estimated_prompt_tokens": request_payload["estimated_prompt_tokens"],
+                    "max_output_tokens": max_output_tokens,
+                    "estimated_total_tokens": request_payload["estimated_prompt_tokens"] + max_output_tokens,
+                    "response_chars": int(meta.get("response_chars", 0)) if isinstance(meta, dict) else 0,
+                }
+            )
+    else:
+        prepared_by_page = {item["page"]: item for item in prepared_pages}
+        success_map = {}
+        failure_map = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(process_page, prepared): prepared["page"] for prepared in prepared_pages}
+            for future in as_completed(futures):
+                page = futures[future]
+                try:
+                    _, translated_chunk, meta = future.result()
+                except Exception as exc:
+                    translated_chunk, meta = None, {"reason": f"error:{exc}"}
+
+                if translated_chunk is None:
+                    failure_map[page] = meta
+                else:
+                    success_map[page] = (translated_chunk, meta)
+
+        if failure_map:
+            first_failed_page = sorted(failure_map.keys())[0]
+            return None, {
+                "used": False,
+                "reason": "page_batch_failed",
+                "page": first_failed_page,
+                "meta": failure_map[first_failed_page],
+                "pages_done": len(success_map),
+                "pages_total": len(prepared_pages),
+            }
+
+        for page in sorted(success_map.keys()):
+            translated_chunk, meta = success_map[page]
+            prepared = prepared_by_page[page]
+            request_payload = prepared["request_payload"]
+            translated_by_id.update(translated_chunk)
+            page_summaries.append(
+                {
+                    "page": page,
+                    "items": len(prepared["items"]),
+                    "input_chars": prepared["input_chars"],
+                    "payload_chars": request_payload["payload_chars"],
+                    "prompt_chars": request_payload["prompt_chars"],
+                    "estimated_prompt_tokens": request_payload["estimated_prompt_tokens"],
+                    "max_output_tokens": max_output_tokens,
+                    "estimated_total_tokens": request_payload["estimated_prompt_tokens"] + max_output_tokens,
+                    "response_chars": int(meta.get("response_chars", 0)) if isinstance(meta, dict) else 0,
+                }
+            )
 
     results = []
     for block in data:
@@ -904,13 +1274,9 @@ def translate_blocks_llm_structured_adaptive(data, llm_options, max_input_chars=
     return results, {
         "used": True,
         "reason": "ok",
-        "initial_items": len(items),
-        "initial_chars": initial_chars,
-        "split_events": split_events,
-        "successful_batches": successful_batches,
-        "min_batch_items": 1,
-        "configured_min_batch_items": configured_min_batch_items,
-        "max_stable_batch_size": max_stable_batch_size,
+        "pages_total": len(page_items),
+        "pages_translated": len(page_summaries),
+        "page_summaries": page_summaries,
         "max_input_chars": max_input_chars,
     }
 
@@ -973,8 +1339,14 @@ def translate_with_lmstudio(llm_options, text, keep_markers=False, request_meta=
                 log_label=request_label,
             )
             if translated:
-                if has_verbatim_source_overlap(cleaned, translated):
-                    log_warn("LLM output included verbatim source English; retrying request.")
+                detected_echo, echo_detail = detect_verbatim_source_overlap(cleaned, translated)
+                if detected_echo:
+                    match_preview = (echo_detail or {}).get("match", "")
+                    rule = (echo_detail or {}).get("rule", "unknown")
+                    log_warn(
+                        "LLM output included verbatim source English; retrying request. "
+                        f"rule={rule} match={match_preview[:160]}"
+                    )
                     translated = None
                     time.sleep(0.5)
                     continue
@@ -1374,24 +1746,60 @@ def translate_blocks(input_json, output_json, llm_options, debug_json_path=None)
 
     translation_segments = build_translation_segments(data)
     engine_label = "LM Studio" if engine == "llm" else "Google Translate"
+    llm_translate_mode = llm_options.get("llm_translate_mode", "page")
+    llm_page_stats_only = bool(llm_options.get("llm_page_stats_only", False))
 
-    llm_single_call_info = None
-    if engine == "llm" and llm_options.get("llm_single_call", True):
-        log_info("Trying structured LLM translation with adaptive batch splitting...")
-        single_results, llm_single_call_info = translate_blocks_llm_structured_adaptive(
+    llm_page_info = None
+    llm_page_stats = None
+
+    if engine == "llm" and llm_translate_mode == "page":
+        if llm_page_stats_only:
+            llm_page_stats = collect_page_request_stats(
+                data,
+                llm_options=llm_options["llm"],
+                max_input_chars=max(1000, int(llm_options.get("llm_page_max_chars", 70000))),
+            )
+            for stat in llm_page_stats:
+                log_info(
+                    "[LLM page stats] "
+                    f"page={stat['page']} items={stat['items']} input_chars={stat['input_chars']} "
+                    f"payload_chars={stat['payload_chars']} prompt_chars={stat['prompt_chars']} "
+                    f"est_prompt_tokens={stat['estimated_prompt_tokens']} max_output_tokens={stat['max_output_tokens']} "
+                    f"est_total_tokens={stat['estimated_total_tokens']} over_limit={stat['over_input_char_limit']}"
+                )
+
+            if debug_json_path:
+                debug_payload = {
+                    "segment_debug": [],
+                    "engine": engine,
+                    "workers": 1,
+                    "llm_translate_mode": llm_translate_mode,
+                    "llm_page_stats_only": True,
+                    "llm_page_stats": llm_page_stats,
+                }
+                with open(debug_json_path, "w", encoding="utf-8") as f:
+                    json.dump(debug_payload, f, ensure_ascii=False, indent=2)
+
+            return {
+                "stats_only": True,
+                "llm_page_stats": llm_page_stats,
+            }
+
+        log_info("Trying page-wise structured LLM translation...")
+        page_results, llm_page_info = translate_blocks_llm_page_mode(
             data,
             llm_options=llm_options["llm"],
-            max_input_chars=max(1000, int(llm_options.get("llm_single_call_max_chars", 180000))),
-            min_batch_items=max(1, int(llm_options.get("llm_single_call_min_batch_items", 8))),
+            max_input_chars=max(1000, int(llm_options.get("llm_page_max_chars", 70000))),
+            max_workers=max(1, int(llm_options.get("max_workers", 1))),
         )
-        if single_results is not None:
+        if page_results is not None:
             translated_count = sum(
                 1
-                for block in single_results
+                for block in page_results
                 if block.get("text") != block.get("original_text") and not is_page_number_or_code(block.get("original_text", ""))
             )
             with open(output_json, "w", encoding="utf-8") as f:
-                json.dump(single_results, f, ensure_ascii=False, indent=2)
+                json.dump(page_results, f, ensure_ascii=False, indent=2)
 
             if debug_json_path:
                 debug_payload = {
@@ -1406,23 +1814,39 @@ def translate_blocks(input_json, output_json, llm_options, debug_json_path=None)
                         "max_tokens": llm_options["llm"]["max_tokens"],
                         "max_workers": 1,
                     },
-                    "llm_single_call": llm_single_call_info,
+                    "llm_translate_mode": llm_translate_mode,
+                    "llm_page": llm_page_info,
                 }
                 with open(debug_json_path, "w", encoding="utf-8") as f:
                     json.dump(debug_payload, f, ensure_ascii=False, indent=2)
 
             log_info(
-                "Structured translation completed: "
-                f"initial_items={llm_single_call_info.get('initial_items')}, "
-                f"split_events={llm_single_call_info.get('split_events')}, "
-                f"successful_batches={llm_single_call_info.get('successful_batches')}"
+                "Page-wise translation completed: "
+                f"pages={llm_page_info.get('pages_translated', 0)}/{llm_page_info.get('pages_total', 0)}"
             )
             log_info(f"Completed translation! Saved to {output_json}. Total translated: {translated_count}")
             log_final_statistics(engine=engine, started_at=pipeline_started_at, translated_count=translated_count)
             return
 
-        reason = llm_single_call_info.get("reason") if isinstance(llm_single_call_info, dict) else "unknown"
-        log_warn(f"Single-call structured translation skipped/fallback: {reason}")
+        page_reason = llm_page_info.get("reason") if isinstance(llm_page_info, dict) else "unknown"
+        error_message = build_page_failure_message(llm_page_info, llm_options.get("llm", {}))
+        log_error(error_message)
+        if debug_json_path:
+            debug_payload = {
+                "segment_debug": [],
+                "engine": engine,
+                "workers": 1,
+                "llm_translate_mode": llm_translate_mode,
+                "llm_page": llm_page_info,
+                "failure": {
+                    "stage": "page_mode",
+                    "reason": page_reason,
+                    "message": error_message,
+                },
+            }
+            with open(debug_json_path, "w", encoding="utf-8") as f:
+                json.dump(debug_payload, f, ensure_ascii=False, indent=2)
+        raise RuntimeError(error_message)
 
     log_info(f"Starting {engine_label} translation of {len(data)} blocks in {len(translation_segments)} segments...")
 
@@ -1471,6 +1895,7 @@ def translate_blocks(input_json, output_json, llm_options, debug_json_path=None)
             "segment_debug": segment_debug,
             "engine": engine,
             "workers": max_workers,
+            "llm_translate_mode": llm_translate_mode,
         }
         if engine == "llm":
             llm_cfg = llm_options["llm"]
@@ -1482,8 +1907,8 @@ def translate_blocks(input_json, output_json, llm_options, debug_json_path=None)
                 "max_tokens": llm_cfg["max_tokens"],
                 "max_workers": max_workers,
             }
-        if llm_single_call_info is not None:
-            debug_payload["llm_single_call"] = llm_single_call_info
+        if llm_page_info is not None:
+            debug_payload["llm_page"] = llm_page_info
         with open(debug_json_path, "w", encoding="utf-8") as f:
             json.dump(debug_payload, f, ensure_ascii=False, indent=2)
 
@@ -1535,13 +1960,34 @@ def run_pipeline(source_pdf, output_pdf, translate_options):
     engine_label = "LM Studio" if engine == "llm" else "Google Translate"
     log_info(f"[2/4] Translating blocks to Japanese with {engine_label}")
     translate_started_at = time.time()
-    translate_blocks(
+    translate_result = translate_blocks(
         extracted_json,
         translated_json,
         llm_options=translate_options,
         debug_json_path=segment_debug_json,
     )
     translate_elapsed = time.time() - translate_started_at
+
+    if translate_options.get("llm_page_stats_only", False):
+        total_elapsed = time.time() - pipeline_started_at
+        log_info("[3/4] Skipped PDF generation (stats-only mode).")
+        log_info(
+            "Stage time: "
+            f"extract={format_elapsed(extract_elapsed)} "
+            f"translate={format_elapsed(translate_elapsed)} "
+            f"total={format_elapsed(total_elapsed)}"
+        )
+        if isinstance(translate_result, dict):
+            stats = translate_result.get("llm_page_stats") or []
+            first_page = stats[0] if stats else None
+            if first_page:
+                log_info(
+                    "First page stats: "
+                    f"page={first_page['page']} items={first_page['items']} input_chars={first_page['input_chars']} "
+                    f"prompt_chars={first_page['prompt_chars']} est_prompt_tokens={first_page['estimated_prompt_tokens']} "
+                    f"max_output_tokens={first_page['max_output_tokens']}"
+                )
+        return
 
     log_info(f"[3/4] Generating translated PDF: {output_pdf}")
     generate_started_at = time.time()
@@ -1570,6 +2016,18 @@ def run_pipeline(source_pdf, output_pdf, translate_options):
 
 
 if __name__ == "__main__":
+    # Bootstrap parse to know source_pdf/env-file, then load .env before building
+    # the main parser defaults from environment variables.
+    bootstrap_parser = argparse.ArgumentParser(add_help=False)
+    bootstrap_parser.add_argument("source_pdf", nargs="?")
+    bootstrap_parser.add_argument("--env-file", default=None)
+    bootstrap_args, _ = bootstrap_parser.parse_known_args()
+
+    loaded_count, loaded_files = load_dotenv_candidates(
+        source_pdf_path=bootstrap_args.source_pdf,
+        explicit_env_file=bootstrap_args.env_file,
+    )
+
     parser = argparse.ArgumentParser(
         description="Translate an English PDF into a Japanese PDF while preserving layout."
     )
@@ -1620,22 +2078,22 @@ if __name__ == "__main__":
         help="Concurrent translation workers",
     )
     parser.add_argument(
-        "--llm-single-call",
+        "--llm-translate-mode",
+        choices=["page", "segment"],
+        default=os.environ.get("LLM_TRANSLATE_MODE", "page"),
+        help="LLM translation mode after optional single-call step: page (default) or segment",
+    )
+    parser.add_argument(
+        "--llm-page-max-chars",
+        type=int,
+        default=int(os.environ.get("LLM_PAGE_MAX_CHARS", "70000")),
+        help="Maximum total input characters per page request in page mode",
+    )
+    parser.add_argument(
+        "--llm-page-stats-only",
         action=argparse.BooleanOptionalAction,
-        default=os.environ.get("LLM_SINGLE_CALL", "1") not in ("0", "false", "False"),
-        help="Try one structured LLM API call for full-document translation before segmented fallback (llm engine only)",
-    )
-    parser.add_argument(
-        "--llm-single-call-max-chars",
-        type=int,
-        default=int(os.environ.get("LLM_SINGLE_CALL_MAX_CHARS", "180000")),
-        help="Maximum total input characters per structured LLM batch",
-    )
-    parser.add_argument(
-        "--llm-single-call-min-batch-items",
-        type=int,
-        default=int(os.environ.get("LLM_SINGLE_CALL_MIN_BATCH_ITEMS", "8")),
-        help="Minimum batch size when adaptive structured LLM batching retries with smaller batches",
+        default=os.environ.get("LLM_PAGE_STATS_ONLY", "0") not in ("0", "false", "False"),
+        help="Collect per-page LLM payload stats (chars/tokens estimates) without calling LM Studio API",
     )
     parser.add_argument(
         "--google-timeout",
@@ -1645,15 +2103,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--env-file",
-        default=None,
+        default=bootstrap_args.env_file,
         help="Optional .env file path. By default, .env in cwd/script/source-pdf dir are auto-loaded.",
     )
     args = parser.parse_args()
 
-    loaded_count, loaded_files = load_dotenv_candidates(
-        source_pdf_path=args.source_pdf,
-        explicit_env_file=args.env_file,
-    )
     if loaded_count > 0:
         log_info(f"Loaded {loaded_count} env vars from: {', '.join(loaded_files)}")
 
@@ -1661,9 +2115,9 @@ if __name__ == "__main__":
         "engine": args.engine,
         "google_timeout": args.google_timeout,
         "max_workers": args.lmstudio_max_workers,
-        "llm_single_call": args.llm_single_call,
-        "llm_single_call_max_chars": args.llm_single_call_max_chars,
-        "llm_single_call_min_batch_items": args.llm_single_call_min_batch_items,
+        "llm_translate_mode": args.llm_translate_mode,
+        "llm_page_max_chars": args.llm_page_max_chars,
+        "llm_page_stats_only": args.llm_page_stats_only,
         "llm": {
             "base_url": args.lmstudio_base_url,
             "model": args.lmstudio_model,
