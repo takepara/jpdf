@@ -1,6 +1,7 @@
 # Ignore source and generated PDF files
 *.json
 *.pdf
+*.png
 .vscode/
 __pycache__/
 .env

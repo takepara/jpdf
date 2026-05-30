@@ -120,7 +120,7 @@ def log_final_statistics(engine, started_at, translated_count):
     total_elapsed = time.time() - started_at
     log_info(f"Total processing time: {format_elapsed(total_elapsed)}")
 
-    if engine not in ("llm", "hybrid"):
+    if engine != "llm":
         return
 
     metrics = snapshot_llm_metrics()
@@ -1032,281 +1032,6 @@ def translate_text(translate_options, text, keep_markers=False):
     return translate_with_google(text, timeout=translate_options.get("google_timeout", 30))
 
 
-def hybrid_segment_score(source_text, translated_text):
-    score = 0
-    reasons = []
-
-    cleaned_source = normalize_text(source_text)
-    cleaned_translated = normalize_text(translated_text)
-    if not cleaned_translated:
-        return score, reasons
-
-    ascii_letters = len(re.findall(r"[A-Za-z]", cleaned_translated))
-    ascii_ratio = ascii_letters / max(1, len(cleaned_translated))
-    if ascii_ratio >= 0.15:
-        score += 1
-        reasons.append("high_ascii_ratio")
-
-    if re.search(r"\b(the|and|for|with|from|into|that|this|are|is|to|of)\b", cleaned_translated, flags=re.IGNORECASE):
-        score += 1
-        reasons.append("english_word_residue")
-
-    source_len = len(cleaned_source)
-    translated_len = len(cleaned_translated)
-    if source_len >= 40:
-        length_ratio = translated_len / max(1, source_len)
-        if length_ratio < 0.45 or length_ratio > 1.35:
-            score += 1
-            reasons.append("length_ratio_outlier")
-
-    if translated_len >= 120 and "。" not in cleaned_translated and "、" not in cleaned_translated:
-        score += 1
-        reasons.append("low_japanese_punctuation")
-
-    return score, reasons
-
-
-HYBRID_EXCLUDE_PATTERNS = [
-    r"references?",
-    r"bibliography",
-    r"appendix",
-    r"sources?",
-    r"disclaimer",
-    r"copyright",
-    r"all rights reserved",
-    r"deloitte\s+llp",
-    r"registered",
-    r"registration\s+number",
-    r"\bnc\d{3,}\b",
-    r"limited liability",
-    r"免責",
-    r"著作権",
-    r"参考文献",
-    r"出典",
-    r"付録",
-    r"登録番号",
-    r"有限責任",
-]
-
-HYBRID_HALLUCINATION_MARKERS = [
-    "SOURCE_EN:",
-    "SOURCE_JA:",
-    "[製品名]",
-    "[モデル番号]",
-    "AwesomeGadget",
-    "URL:",
-]
-
-
-def extract_numeric_tokens(text):
-    return set(re.findall(r"\d+(?:[\.,]\d+)?%?", text))
-
-
-def sentence_uniqueness_ratio(text):
-    sentences = [s.strip() for s in re.split(r"[。！？!?]+", text) if len(s.strip()) >= 10]
-    if len(sentences) < 4:
-        return 1.0
-    return len(set(sentences)) / len(sentences)
-
-
-def is_hybrid_naturalization_candidate(segment, source_text, translated_text, min_chars):
-    normalized_source = normalize_text(source_text)
-    normalized_translated = normalize_text(translated_text)
-
-    if len(normalized_translated) < min_chars:
-        return False, "too_short"
-
-    merged_lower = (normalized_source + " " + normalized_translated).lower()
-    for pattern in HYBRID_EXCLUDE_PATTERNS:
-        if re.search(pattern, merged_lower, flags=re.IGNORECASE):
-            return False, "excluded_pattern"
-
-    url_hits = len(re.findall(r"https?://", normalized_source + " " + normalized_translated, flags=re.IGNORECASE))
-    if url_hits >= 1:
-        return False, "url_heavy"
-
-    citation_hits = len(re.findall(r"\(\d{1,3}\)", normalized_source + " " + normalized_translated))
-    if citation_hits >= 4:
-        return False, "citation_heavy"
-
-    blocks = segment["blocks"]
-    if blocks:
-        avg_size = sum(float(block.get("size", 10.0)) for block in blocks) / len(blocks)
-        if avg_size <= 8.5:
-            return False, "small_font"
-
-    return True, "candidate"
-
-
-def validate_naturalized_text(base_text, candidate_text):
-    normalized_base = normalize_text(base_text)
-    normalized_candidate = normalize_text(candidate_text)
-
-    if not normalized_candidate:
-        return False, "empty"
-
-    for marker in HYBRID_HALLUCINATION_MARKERS:
-        if marker.lower() in normalized_candidate.lower():
-            return False, "hallucination_marker"
-
-    if re.search(r"\bSOURCE_[A-Z]+\b", normalized_candidate):
-        return False, "prompt_leak"
-
-    base_len = len(normalized_base)
-    cand_len = len(normalized_candidate)
-    length_ratio = cand_len / max(1, base_len)
-    if length_ratio < 0.70 or length_ratio > 1.30:
-        return False, "length_ratio"
-
-    base_urls = len(re.findall(r"https?://", normalized_base, flags=re.IGNORECASE))
-    cand_urls = len(re.findall(r"https?://", normalized_candidate, flags=re.IGNORECASE))
-    if cand_urls > base_urls:
-        return False, "url_increase"
-
-    base_numbers = extract_numeric_tokens(normalized_base)
-    if base_numbers:
-        cand_numbers = extract_numeric_tokens(normalized_candidate)
-        kept = sum(1 for token in base_numbers if token in cand_numbers)
-        if kept / len(base_numbers) < 0.85:
-            return False, "number_loss"
-
-    uniq_ratio = sentence_uniqueness_ratio(normalized_candidate)
-    if uniq_ratio < 0.75:
-        return False, "repetition"
-
-    repeated_span = re.search(r"(.{24,80}?)(?:\s*\1){2,}", normalized_candidate)
-    if repeated_span:
-        return False, "span_repetition"
-
-    ascii_base = len(re.findall(r"[A-Za-z]", normalized_base)) / max(1, base_len)
-    ascii_candidate = len(re.findall(r"[A-Za-z]", normalized_candidate)) / max(1, cand_len)
-    if ascii_candidate > max(0.35, ascii_base + 0.15):
-        return False, "ascii_increase"
-
-    return True, "ok"
-
-
-def naturalize_hybrid_segment(segment, translated_segment, translate_options):
-    blocks = segment["blocks"]
-    current_text = "\n\n".join(normalize_for_translation(block["text"], preserve_paragraph_break=True) for block in translated_segment)
-    naturalized = naturalize_with_lmstudio(translate_options["llm"], current_text)
-    if not naturalized:
-        return None, "naturalize_failed"
-
-    is_valid, validate_note = validate_naturalized_text(current_text, naturalized)
-    if not is_valid:
-        return None, f"naturalize_rejected:{validate_note}"
-
-    if len(translated_segment) == 1:
-        updated = translated_segment[0].copy()
-        updated["text"] = naturalized
-        return [updated], "naturalized_single"
-
-    chunks = split_japanese_chunks(naturalized)
-    reassigned = assign_chunks_to_blocks(chunks, blocks)
-    if reassigned is None:
-        return None, "naturalize_reassign_failed"
-
-    updated = []
-    for base_block, new_text in zip(translated_segment, reassigned):
-        block_copy = base_block.copy()
-        block_copy["text"] = new_text
-        updated.append(block_copy)
-    return updated, "naturalized_reassigned"
-
-
-def run_hybrid_refinement(translation_segments, segment_slots, segment_debug, translate_options):
-    max_segments = max(0, int(translate_options.get("hybrid_max_segments", 40)))
-    min_chars = max(1, int(translate_options.get("hybrid_min_chars", 100)))
-    min_score = max(1, int(translate_options.get("hybrid_min_score", 2)))
-
-    candidates = []
-    for idx, (segment, translated_segment) in enumerate(zip(translation_segments, segment_slots)):
-        if segment["kind"] != "paragraph" or not translated_segment:
-            continue
-
-        source_text = "\n\n".join(block["text"] for block in segment["blocks"])
-        translated_text = "\n\n".join(block["text"] for block in translated_segment)
-        can_naturalize, candidate_note = is_hybrid_naturalization_candidate(
-            segment,
-            source_text,
-            translated_text,
-            min_chars,
-        )
-        if not can_naturalize:
-            if segment_debug[idx] is not None:
-                segment_debug[idx]["hybrid_refined"] = False
-                segment_debug[idx]["hybrid_note"] = f"candidate_skip:{candidate_note}"
-            continue
-
-        score, reasons = hybrid_segment_score(source_text, translated_text)
-        if score < min_score:
-            if segment_debug[idx] is not None:
-                segment_debug[idx]["hybrid_refined"] = False
-                segment_debug[idx]["hybrid_note"] = "candidate_skip:low_score"
-            continue
-
-        candidates.append(
-            {
-                "idx": idx,
-                "score": score,
-                "length": len(normalize_text(translated_text)),
-                "reasons": reasons,
-            }
-        )
-
-    candidates.sort(key=lambda item: (item["score"], item["length"]), reverse=True)
-    selected = candidates[:max_segments]
-
-    if not selected:
-        return {"selected": 0, "updated": 0, "skipped": len(candidates), "details": []}
-
-    workers = max(1, int(translate_options.get("hybrid_workers", 2)))
-    selected_map = {item["idx"]: item for item in selected}
-    details = []
-    updated_count = 0
-
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(
-                naturalize_hybrid_segment,
-                translation_segments[item["idx"]],
-                segment_slots[item["idx"]],
-                translate_options,
-            ): item["idx"]
-            for item in selected
-        }
-
-        for future in as_completed(futures):
-            idx = futures[future]
-            item = selected_map[idx]
-            try:
-                refined_segment, note = future.result()
-                if refined_segment is not None:
-                    segment_slots[idx] = refined_segment
-                    updated_count += 1
-                    if segment_debug[idx] is not None:
-                        segment_debug[idx]["hybrid_refined"] = True
-                        segment_debug[idx]["hybrid_note"] = note
-                        segment_debug[idx]["hybrid_score"] = item["score"]
-                        segment_debug[idx]["hybrid_reasons"] = item["reasons"]
-                elif segment_debug[idx] is not None:
-                    segment_debug[idx]["hybrid_refined"] = False
-                    segment_debug[idx]["hybrid_note"] = note
-                    segment_debug[idx]["hybrid_score"] = item["score"]
-                    segment_debug[idx]["hybrid_reasons"] = item["reasons"]
-                details.append({"idx": idx, "score": item["score"], "result": note, "reasons": item["reasons"]})
-            except Exception as exc:
-                details.append({"idx": idx, "score": item["score"], "result": f"error:{exc}", "reasons": item["reasons"]})
-
-    return {
-        "selected": len(selected),
-        "updated": updated_count,
-        "skipped": max(0, len(candidates) - len(selected)),
-        "details": details,
-    }
-
-
 def translate_single_block(block, translate_options):
     text = block["text"]
     if is_page_number_or_code(text):
@@ -1644,7 +1369,7 @@ def translate_blocks(input_json, output_json, llm_options, debug_json_path=None)
         data = json.load(f)
 
     engine = llm_options.get("engine", "google")
-    if engine in ("llm", "hybrid"):
+    if engine == "llm":
         reset_llm_metrics()
 
     translation_segments = build_translation_segments(data)
@@ -1726,15 +1451,6 @@ def translate_blocks(input_json, output_json, llm_options, debug_json_path=None)
                     f"elapsed={format_elapsed(elapsed)}"
                 )
 
-    hybrid_summary = None
-    if engine == "hybrid":
-        log_info("Starting hybrid naturalization pass with LM Studio...")
-        hybrid_summary = run_hybrid_refinement(translation_segments, segment_slots, segment_debug, llm_options)
-        log_info(
-            "Hybrid naturalization completed: "
-            f"selected={hybrid_summary['selected']}, updated={hybrid_summary['updated']}, skipped={hybrid_summary['skipped']}"
-        )
-
     translated_blocks = []
     for translated_segment in segment_slots:
         translated_blocks.extend(translated_segment)
@@ -1756,7 +1472,7 @@ def translate_blocks(input_json, output_json, llm_options, debug_json_path=None)
             "engine": engine,
             "workers": max_workers,
         }
-        if engine in ("llm", "hybrid"):
+        if engine == "llm":
             llm_cfg = llm_options["llm"]
             debug_payload["llm"] = {
                 "provider": "lmstudio",
@@ -1768,8 +1484,6 @@ def translate_blocks(input_json, output_json, llm_options, debug_json_path=None)
             }
         if llm_single_call_info is not None:
             debug_payload["llm_single_call"] = llm_single_call_info
-        if hybrid_summary is not None:
-            debug_payload["hybrid"] = hybrid_summary
         with open(debug_json_path, "w", encoding="utf-8") as f:
             json.dump(debug_payload, f, ensure_ascii=False, indent=2)
 
@@ -1781,8 +1495,6 @@ def build_default_output_pdf(source_pdf, engine="google"):
     source_path = Path(source_pdf)
     if engine == "llm":
         suffix = "_LLM"
-    elif engine == "hybrid":
-        suffix = "_HYBRID"
     else:
         suffix = "_G"
     return str(source_path.with_name(f"{source_path.stem}{suffix}.pdf"))
@@ -1820,7 +1532,7 @@ def run_pipeline(source_pdf, output_pdf, translate_options):
     extract_pdf_text(str(source_path), extracted_json)
     extract_elapsed = time.time() - extract_started_at
 
-    engine_label = "LM Studio" if engine == "llm" else ("Google + LM Studio Hybrid" if engine == "hybrid" else "Google Translate")
+    engine_label = "LM Studio" if engine == "llm" else "Google Translate"
     log_info(f"[2/4] Translating blocks to Japanese with {engine_label}")
     translate_started_at = time.time()
     translate_blocks(
@@ -1865,13 +1577,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "output_pdf",
         nargs="?",
-        help="Path to output Japanese PDF (default by engine: _G / _HYBRID / _LLM)",
+        help="Path to output Japanese PDF (default by engine: _G / _LLM)",
     )
     parser.add_argument(
         "--engine",
-        choices=["google", "llm", "hybrid"],
+        choices=["google", "llm"],
         default=os.environ.get("TRANSLATION_ENGINE", "google"),
-        help="Translation engine: google (default), hybrid, or llm",
+        help="Translation engine: google (default) or llm",
     )
     parser.add_argument(
         "--lmstudio-base-url",
@@ -1932,30 +1644,6 @@ if __name__ == "__main__":
         help="Google Translate HTTP timeout seconds",
     )
     parser.add_argument(
-        "--hybrid-max-segments",
-        type=int,
-        default=int(os.environ.get("HYBRID_MAX_SEGMENTS", "40")),
-        help="Maximum number of segments to naturalize in hybrid mode",
-    )
-    parser.add_argument(
-        "--hybrid-min-chars",
-        type=int,
-        default=int(os.environ.get("HYBRID_MIN_CHARS", "100")),
-        help="Minimum translated characters to consider hybrid naturalization",
-    )
-    parser.add_argument(
-        "--hybrid-min-score",
-        type=int,
-        default=int(os.environ.get("HYBRID_MIN_SCORE", "2")),
-        help="Minimum heuristic score required for hybrid naturalization",
-    )
-    parser.add_argument(
-        "--hybrid-workers",
-        type=int,
-        default=int(os.environ.get("HYBRID_WORKERS", "2")),
-        help="Concurrent workers for LM Studio naturalization in hybrid mode",
-    )
-    parser.add_argument(
         "--env-file",
         default=None,
         help="Optional .env file path. By default, .env in cwd/script/source-pdf dir are auto-loaded.",
@@ -1976,10 +1664,6 @@ if __name__ == "__main__":
         "llm_single_call": args.llm_single_call,
         "llm_single_call_max_chars": args.llm_single_call_max_chars,
         "llm_single_call_min_batch_items": args.llm_single_call_min_batch_items,
-        "hybrid_max_segments": args.hybrid_max_segments,
-        "hybrid_min_chars": args.hybrid_min_chars,
-        "hybrid_min_score": args.hybrid_min_score,
-        "hybrid_workers": args.hybrid_workers,
         "llm": {
             "base_url": args.lmstudio_base_url,
             "model": args.lmstudio_model,
