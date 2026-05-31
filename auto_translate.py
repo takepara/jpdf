@@ -552,6 +552,7 @@ def build_structured_translate_prompt(payload_json):
         "各 item ごとに自己検査を実施し、A-Z/a-z の連続語を検出したら、許可例外以外は必ず日本語に直してください。 "
         "特に3語以上の英語句が t に残っていたら、その item は不合格として再翻訳してください。 "
         "id ごとに完全翻訳を保証し、1件でも不合格 item がある状態で出力してはいけません。 "
+        "【重要】以下のidに関するルールを絶対に破ってはいけません。idは入力JSONの値を一文字も変更せず、そのまま出力してください。idを改変・省略・追加・重複してはいけません。idの順序・件数も入力と完全一致させてください。idは絶対に自分で新たに生成せず、入力の値をそのまま使ってください。idが1つでも違えば全体が不合格です。 "
         "必ず次の形式の正しい JSON のみを返してください: "
         '{"items":[{"id":"<same id>","t":"<translated text>"}]} . '
         "説明文、Markdownフェンス、余計なキーは出力してはいけません。 "
@@ -1043,27 +1044,38 @@ def translate_structured_items_once(items, llm_options, batch_label="", request_
     had_id_mismatch = expected_ids != actual_ids
     missing_count = 0
     extra_count = 0
+    force_split = False
     if had_id_mismatch:
         missing_ids = list(expected_ids - actual_ids)
         extra_ids = list(actual_ids - expected_ids)
         missing_count = len(missing_ids)
         extra_count = len(extra_ids)
         log_warn(
-            "id_mismatch_detected (continuing): "
+            "id_mismatch_detected: "
             f"missing={missing_count} extra={extra_count}"
         )
-
         # Fallback 1: remap by position when model returned same count but wrong IDs.
         if len(output_texts_in_order) == len(source_items_by_index):
+            log_info("[id_mismatch] remap by position (count一致)")
             remapped = {}
             for idx, src_item in enumerate(source_items_by_index):
                 remapped[src_item["id"]] = output_texts_in_order[idx]
             translated_by_id = remapped
             actual_ids = set(translated_by_id.keys())
+            # 再チェック
+            if expected_ids != actual_ids:
+                log_warn("[id_mismatch] remap後もid不一致。分割再実行を要求")
+                force_split = True
+            else:
+                log_info("[id_mismatch] remapでid一致に回復")
+        else:
+            log_warn("[id_mismatch] remap不可。分割再実行を要求")
+            force_split = True
 
-    if allow_text_repair:
+    if allow_text_repair and not force_split:
         suspect_items = [item for item in items if has_unwanted_english_fragment(translated_by_id.get(item["id"], ""))]
         if suspect_items:
+            log_info(f"[id_mismatch] {len(suspect_items)}件のテキスト修復を試行")
             repaired_by_id = dict(translated_by_id)
             repaired_count = 0
             for suspect_rank, item in enumerate(suspect_items, start=1):
@@ -1090,10 +1102,14 @@ def translate_structured_items_once(items, llm_options, batch_label="", request_
                     repaired_count += 1
 
             if repaired_count > 0:
+                log_info(f"[id_mismatch] テキスト修復で{repaired_count}件回復")
                 translated_by_id = repaired_by_id
                 actual_ids = set(translated_by_id.keys())
+            else:
+                log_warn("[id_mismatch] テキスト修復でも回復せず。分割再実行を要求")
+                force_split = True
 
-    return translated_by_id, {
+    meta = {
         "reason": "ok_with_warnings" if had_id_mismatch else "ok",
         "input_chars": input_chars,
         "items": len(items),
@@ -1102,6 +1118,9 @@ def translate_structured_items_once(items, llm_options, batch_label="", request_
         "id_mismatch_missing": missing_count,
         "id_mismatch_extra": extra_count,
     }
+    if force_split:
+        meta["force_split"] = True
+    return translated_by_id, meta
 
 
 def build_structured_translation_items_by_page(data):
@@ -1339,6 +1358,12 @@ def translate_blocks_llm_page_mode(
                 meta = meta if isinstance(meta, dict) else {"reason": "unknown"}
                 last_meta = meta
                 response_chars_sum += int(meta.get("response_chars", 0))
+
+                # id_mismatch等でforce_splitが要求された場合は即分割へ
+                if meta.get("force_split"):
+                    log_warn(f"[LLM page] id_mismatch/force_split: split page={page} level={split_level}->{split_level + 1} items={len(chunk_items)}")
+                    translated_chunk = None
+                    break
 
                 if translated_chunk is not None:
                     break
