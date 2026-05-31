@@ -215,8 +215,54 @@ def load_dotenv_candidates(source_pdf_path=None, explicit_env_file=None):
     return loaded_total, loaded_files
 
 
+def parse_target_pages(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+
+    pages = set()
+    for token in raw.split(","):
+        part = token.strip()
+        if not part:
+            continue
+        if "-" in part:
+            left, right = part.split("-", 1)
+            try:
+                start = int(left.strip())
+                end = int(right.strip())
+            except ValueError:
+                continue
+            if end < start:
+                start, end = end, start
+            for page in range(start, end + 1):
+                if page >= 0:
+                    pages.add(page)
+            continue
+        try:
+            page = int(part)
+        except ValueError:
+            continue
+        if page >= 0:
+            pages.add(page)
+
+    if not pages:
+        return None
+    return sorted(pages)
+
+
 def normalize_text(text):
     return re.sub(r"\s+", " ", text).strip()
+
+
+def has_unwanted_english_fragment(text):
+    cleaned = normalize_text(text or "")
+    if not cleaned:
+        return False
+    if re.fullmatch(r"(?:https?://\S+|www\.\S+|\S+@\S+)", cleaned):
+        return False
+    if re.search(r"\b[A-Za-z]{4,}\b", cleaned):
+        return True
+    return False
 
 
 def is_page_number_or_code(text):
@@ -464,14 +510,22 @@ def split_translated_segment(translated_text, expected_count):
 
 
 def build_translate_prompt(text, keep_markers=False):
-    marker_rule = "Keep all marker lines like __PDFTRANSLATE_BLOCK_0__ unchanged and on their own lines." if keep_markers else ""
+    marker_rule = "__PDFTRANSLATE_BLOCK_0__ のようなマーカー行は変更せず、必ず単独行のまま保持してください。" if keep_markers else ""
     return (
-        "Translate the following English text into natural Japanese. "
-        "Keep numbers, units, URLs, product names, model numbers, and proper nouns unchanged. "
-        "Do not copy any full English sentence or long English phrase from SOURCE into the output. "
-        "Output only the Japanese translation text. "
+        "以下の英語テキストを、正確で自然な日本語に翻訳してください。 "
+        "これは厳密な翻訳であり、リライトではありません。意味、因果関係、確率・断定の強さ、事実のニュアンスを厳密に保持してください。 "
+        "すべての文を完全に翻訳し、要約・省略・追加・弱化を行ってはいけません。 "
+        "出力に英語の文や節を残してはいけません。また英語文を別の英語表現に言い換えることも禁止です。 "
+        "そのまま残してよいラテン文字は、URL・メールアドレス・型番・国際的に固定された製品名/ブランド名のみです。 "
+        "見出し、図表ラベル、短い断片、箇条書きも例外なく日本語にしてください。 "
+        "組織名・人名は一般的な日本語表記を優先し、ない場合はカタカナ化し、必要なら原文を1回だけ括弧で補足してください。 "
+        "英語フレーズが残っていたらエラーです。最終出力前に必ず日本語へ直してください。 "
+        "内部手順: まず全体を翻訳し、その後に最終文面を自己検査してください。 "
+        "自己検査では、A-Z/a-z の連続語を確認し、許可例外（URL・メール・型番・国際固定の製品名/ブランド名）以外は必ず日本語へ再翻訳してください。 "
+        "特に長い英語句（3語以上）が1つでも残っていたら不合格として再翻訳してください。 "
+        "出力は最終的な日本語訳テキストのみを返してください。 "
         f"{marker_rule}\n\n"
-        f"SOURCE:\n{text}"
+        f"原文:\n{text}"
     )
 
 
@@ -487,72 +541,23 @@ def build_naturalize_prompt(text):
 
 def build_structured_translate_prompt(payload_json):
     return (
-        "You are a professional English-to-Japanese translator for business reports. "
-        "Translate each item's text into natural Japanese while preserving meaning. "
-        "Keep numbers, units, URLs, product names, model numbers, and proper nouns unchanged. "
-        "For each item, do not copy any full English sentence or long English phrase from the input into t. "
-        "Return ONLY valid JSON with this exact shape: "
+        "あなたはビジネス文書の英日翻訳者です。 "
+        "各 item について、意味と全情報を保持した厳密な日本語訳を t に作成してください。 "
+        "要約・省略・追加・解釈変更は禁止です。因果関係、確率表現、断定/否定を厳密に保持してください。 "
+        "英語を英語のまま言い換えることは禁止です。原文の英語文は必ず日本語へ翻訳してください。 "
+        "t に英語の文や節を残してはいけません。例外として、URL・メールアドレス・型番・国際的に固定された製品名/ブランド名のみそのまま可。 "
+        "見出し、表のラベル、図中の短い文字列、箇条書きも必ず日本語化してください。 "
+        "組織名・人名は一般的な日本語表記を優先し、ない場合はカタカナ化し、必要なら原文を1回だけ括弧で補足してください。 "
+        "最終チェック: すべての t が日本語として完結し、英語文断片が残っていないことを確認してください。 "
+        "各 item ごとに自己検査を実施し、A-Z/a-z の連続語を検出したら、許可例外以外は必ず日本語に直してください。 "
+        "特に3語以上の英語句が t に残っていたら、その item は不合格として再翻訳してください。 "
+        "id ごとに完全翻訳を保証し、1件でも不合格 item がある状態で出力してはいけません。 "
+        "必ず次の形式の正しい JSON のみを返してください: "
         '{"items":[{"id":"<same id>","t":"<translated text>"}]} . '
-        "Do not add commentary, markdown fences, or extra keys. "
-        "Keep all item ids exactly as given and return one output item per input item.\n\n"
-        f"INPUT_JSON:\n{payload_json}"
+        "説明文、Markdownフェンス、余計なキーは出力してはいけません。 "
+        "id は入力と完全一致させ、入力1件につき出力1件を返してください。\n\n"
+        f"入力JSON:\n{payload_json}"
     )
-
-
-def detect_verbatim_source_overlap(source_text, output_text, min_source_chars=80, min_words=16):
-    source = normalize_text(source_text)
-    output = normalize_text(output_text)
-    if not source or not output:
-        return False, None
-
-    source_lower = source.lower()
-    output_lower = output.lower()
-
-    # Direct full-source echo.
-    if len(source_lower) >= min_source_chars and source_lower in output_lower:
-        return True, {
-            "rule": "full_source",
-            "match": source[:200],
-        }
-
-    # Sentence-level echo for long English clauses.
-    sentence_candidates = [
-        normalize_text(part)
-        for part in re.split(r"[\n\r.!?;:]+", source)
-        if normalize_text(part)
-    ]
-    for candidate in sentence_candidates:
-        words = re.findall(r"[A-Za-z][A-Za-z0-9'\-/]*", candidate)
-        if len(words) >= min_words and candidate.lower() in output_lower:
-            return True, {
-                "rule": "sentence_phrase",
-                "match": candidate[:200],
-                "words": len(words),
-            }
-
-    # Sliding window over English tokens to detect long phrase reuse.
-    english_tokens = re.findall(r"[A-Za-z][A-Za-z0-9'\-/]*", source)
-    if len(english_tokens) >= min_words:
-        for start in range(0, len(english_tokens) - min_words + 1):
-            phrase = " ".join(english_tokens[start : start + min_words])
-            if phrase.lower() in output_lower:
-                return True, {
-                    "rule": "sliding_window",
-                    "match": phrase[:200],
-                    "words": min_words,
-                }
-
-    return False, None
-
-
-def has_verbatim_source_overlap(source_text, output_text, min_source_chars=80, min_words=16):
-    detected, _ = detect_verbatim_source_overlap(
-        source_text,
-        output_text,
-        min_source_chars=min_source_chars,
-        min_words=min_words,
-    )
-    return detected
 
 
 def format_request_log_label(request_meta):
@@ -642,6 +647,55 @@ def structured_items_response_format():
     }
 
 
+def _coerce_message_content_to_text(content):
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            for key in ("text", "content", "value"):
+                value = part.get(key)
+                if isinstance(value, str) and value:
+                    parts.append(value)
+                    break
+        return "".join(parts)
+
+    if isinstance(content, dict):
+        for key in ("text", "content", "value"):
+            value = content.get(key)
+            if isinstance(value, str) and value:
+                return value
+
+    return ""
+
+
+def _extract_choice_text(first_choice):
+    if not isinstance(first_choice, dict):
+        return "", "none"
+
+    message = first_choice.get("message") if isinstance(first_choice, dict) else None
+    if isinstance(message, dict):
+        content_text = _coerce_message_content_to_text(message.get("content"))
+        if content_text.strip():
+            return content_text, "message.content"
+
+        # Qwen系などで本文が reasoning_content 側に入る場合にフォールバック。
+        for key in ("output_text", "text", "reasoning_content"):
+            value = message.get(key)
+            if isinstance(value, str) and value.strip():
+                return value, f"message.{key}"
+
+    for key in ("text", "output_text", "reasoning_content"):
+        value = first_choice.get(key)
+        if isinstance(value, str) and value.strip():
+            return value, f"choice.{key}"
+
+    return "", "none"
+
+
 def lmstudio_complete(
     base_url,
     model,
@@ -678,6 +732,8 @@ def lmstudio_complete(
         ],
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "thinking": {"type": "disabled"},
+        "enable_thinking": False,
     }
     if response_format is not None:
         payload["response_format"] = response_format
@@ -754,24 +810,13 @@ def lmstudio_complete(
         return None
 
     first_choice = choices[0] if isinstance(choices[0], dict) else {}
-    message = first_choice.get("message") if isinstance(first_choice, dict) else None
-    content = ""
-    if isinstance(message, dict):
-        content = message.get("content", "") or ""
-    elif isinstance(first_choice.get("text"), str):
-        # Compatibility fallback for servers that still return text-completion shape.
-        content = first_choice.get("text", "") or ""
-
-    if isinstance(content, list):
-        content = "".join(
-            part.get("text", "")
-            for part in content
-            if isinstance(part, dict)
-        )
-
-    text = content.strip()
+    extracted_text, extracted_field = _extract_choice_text(first_choice)
+    text = extracted_text.strip()
     elapsed = time.time() - started_at
-    log_info(f"[LLM call {call_seq}{label}] done in {elapsed:.1f}s response_chars={len(text)}")
+    log_info(
+        f"[LLM call {call_seq}{label}] done in {elapsed:.1f}s "
+        f"response_chars={len(text)} source_field={extracted_field}"
+    )
     record_llm_metrics(success=True, elapsed=elapsed, prompt_chars=prompt_chars, completion_chars=len(text), usage=usage)
     return text
 
@@ -888,14 +933,16 @@ def build_structured_translation_items(data):
             {
                 "id": f"p{block['page']}_b{block['block_idx']}",
                 "t": normalized,
+                "kind": classify_block_kind(block),
             }
         )
     return items
 
 
 def build_structured_request_payload(items):
-    input_chars = sum(len(item["t"]) for item in items)
-    payload_json = json.dumps({"items": items}, ensure_ascii=False, separators=(",", ":"))
+    payload_items = [{"id": item.get("id", ""), "t": item.get("t", "")} for item in items]
+    input_chars = sum(len(item["t"]) for item in payload_items)
+    payload_json = json.dumps({"items": payload_items}, ensure_ascii=False, separators=(",", ":"))
     prompt = build_structured_translate_prompt(payload_json)
     prompt_chars = len(prompt)
     return {
@@ -908,7 +955,7 @@ def build_structured_request_payload(items):
     }
 
 
-def translate_structured_items_once(items, llm_options, batch_label="", request_meta=None):
+def translate_structured_items_once(items, llm_options, batch_label="", request_meta=None, allow_text_repair=True):
     request_payload = build_structured_request_payload(items)
     input_chars = request_payload["input_chars"]
     prompt = request_payload["prompt"]
@@ -972,54 +1019,88 @@ def translate_structured_items_once(items, llm_options, batch_label="", request_
                 "response_preview": (response_text or "")[:400],
             }
 
-    source_by_id = {item["id"]: item["t"] for item in items}
+    source_items_by_index = list(items)
     out_items = parsed.get("items", [])
     translated_by_id = {}
-    echo_warnings = []
+    output_texts_in_order = []
     for out_item in out_items:
         if not isinstance(out_item, dict):
             continue
         item_id = out_item.get("id")
         translated_text = (out_item.get("t") or "").strip()
-        if not item_id or not translated_text:
+        if not translated_text:
             continue
-        source_text = source_by_id.get(item_id, "")
-        detected_echo, echo_detail = detect_verbatim_source_overlap(source_text, translated_text)
-        if source_text and detected_echo:
-            rule = (echo_detail or {}).get("rule", "unknown")
-            match = (echo_detail or {}).get("match", "")
-            echo_warnings.append(
-                {
-                    "item_id": item_id,
-                    "rule": rule,
-                    "match": match,
-                }
-            )
-            log_warn(
-                "source_echo_detected (continuing): "
-                f"item_id={item_id} rule={rule} match={match[:140]}"
-            )
+        output_texts_in_order.append(translated_text)
+        if not item_id:
+            continue
         if item_id in translated_by_id:
-            return None, {"reason": "duplicate_id", "input_chars": input_chars, "items": len(items)}
+            log_warn(f"duplicate_id_detected (continuing): item_id={item_id}")
+            continue
         translated_by_id[item_id] = translated_text
 
     expected_ids = {item["id"] for item in items}
     actual_ids = set(translated_by_id.keys())
-    if expected_ids != actual_ids:
-        return None, {
-            "reason": "id_mismatch",
-            "missing": len(expected_ids - actual_ids),
-            "extra": len(actual_ids - expected_ids),
-            "input_chars": input_chars,
-            "items": len(items),
-        }
+    had_id_mismatch = expected_ids != actual_ids
+    missing_count = 0
+    extra_count = 0
+    if had_id_mismatch:
+        missing_ids = list(expected_ids - actual_ids)
+        extra_ids = list(actual_ids - expected_ids)
+        missing_count = len(missing_ids)
+        extra_count = len(extra_ids)
+        log_warn(
+            "id_mismatch_detected (continuing): "
+            f"missing={missing_count} extra={extra_count}"
+        )
+
+        # Fallback 1: remap by position when model returned same count but wrong IDs.
+        if len(output_texts_in_order) == len(source_items_by_index):
+            remapped = {}
+            for idx, src_item in enumerate(source_items_by_index):
+                remapped[src_item["id"]] = output_texts_in_order[idx]
+            translated_by_id = remapped
+            actual_ids = set(translated_by_id.keys())
+
+    if allow_text_repair:
+        suspect_items = [item for item in items if has_unwanted_english_fragment(translated_by_id.get(item["id"], ""))]
+        if suspect_items:
+            repaired_by_id = dict(translated_by_id)
+            repaired_count = 0
+            for suspect_rank, item in enumerate(suspect_items, start=1):
+                suspect_map, suspect_meta = translate_structured_items_once(
+                    [item],
+                    llm_options,
+                    batch_label=f"{combined_label} quality_repair={suspect_rank}",
+                    request_meta={
+                        "mode": "quality_repair",
+                        "strategy": "structured_json",
+                        "kind": item.get("kind", "unknown"),
+                        "items": 1,
+                        "chars": len(item.get("t", "")),
+                        "page": effective_meta.get("page"),
+                        "block_idx": effective_meta.get("block_idx"),
+                    },
+                    allow_text_repair=False,
+                )
+                suspect_text = ""
+                if isinstance(suspect_map, dict):
+                    suspect_text = (suspect_map.get(item["id"]) or "").strip()
+                if suspect_text:
+                    repaired_by_id[item["id"]] = suspect_text
+                    repaired_count += 1
+
+            if repaired_count > 0:
+                translated_by_id = repaired_by_id
+                actual_ids = set(translated_by_id.keys())
 
     return translated_by_id, {
-        "reason": "ok_with_warnings" if echo_warnings else "ok",
+        "reason": "ok_with_warnings" if had_id_mismatch else "ok",
         "input_chars": input_chars,
         "items": len(items),
         "response_chars": len(response_text),
-        "echo_warnings": echo_warnings,
+        "id_mismatch_warning": had_id_mismatch,
+        "id_mismatch_missing": missing_count,
+        "id_mismatch_extra": extra_count,
     }
 
 
@@ -1040,6 +1121,7 @@ def build_structured_translation_items_by_page(data):
             {
                 "id": f"p{block['page']}_b{block['block_idx']}",
                 "t": normalized,
+                "kind": classify_block_kind(block),
             }
         )
 
@@ -1095,13 +1177,6 @@ def build_page_failure_message(page_info, llm_options):
     elif reason == "page_batch_failed":
         meta = info.get("meta") if isinstance(info.get("meta"), dict) else {}
         lines.append(f"api_meta_reason={meta.get('reason', 'unknown')}")
-        if meta.get("reason") == "source_echo_detected":
-            if meta.get("echo_item_id"):
-                lines.append(f"echo_item_id={meta.get('echo_item_id')}")
-            if meta.get("echo_rule"):
-                lines.append(f"echo_rule={meta.get('echo_rule')}")
-            if meta.get("echo_match"):
-                lines.append(f"echo_match={str(meta.get('echo_match'))[:200]}")
         if "input_chars" in meta:
             lines.append(f"input_chars={meta.get('input_chars')}")
         if "items" in meta:
@@ -1119,7 +1194,13 @@ def build_page_failure_message(page_info, llm_options):
     return "\n".join(lines)
 
 
-def translate_blocks_llm_page_mode(data, llm_options, max_input_chars=70000, max_workers=1):
+def translate_blocks_llm_page_mode(
+    data,
+    llm_options,
+    max_input_chars=70000,
+    max_workers=1,
+    page_retry_count=1,
+):
     page_items = build_structured_translation_items_by_page(data)
     if not page_items:
         return None, {"used": False, "reason": "no_items"}
@@ -1165,19 +1246,196 @@ def translate_blocks_llm_page_mode(data, llm_options, max_input_chars=70000, max
         page = prepared["page"]
         items = prepared["items"]
         input_chars = prepared["input_chars"]
-        translated_chunk, meta = translate_structured_items_once(
-            items,
-            llm_options,
-            batch_label=f"page={page} items={len(items)} chars={input_chars}",
-            request_meta={
-                "mode": "page_batch",
-                "strategy": "structured_json",
-                "kind": "mixed",
-                "page": page,
-                "items": len(items),
-                "chars": input_chars,
-            },
-        )
+
+        max_attempts = max(1, int(page_retry_count) + 1)
+        max_split_level = 2  # full page -> half -> quarter
+
+        def split_items_half(chunk_items):
+            if len(chunk_items) <= 1:
+                return [chunk_items]
+            mid = max(1, len(chunk_items) // 2)
+            left = chunk_items[:mid]
+            right = chunk_items[mid:]
+            if not right:
+                return [left]
+            return [left, right]
+
+        def source_fallback(chunk_items, existing_map=None):
+            mapped = dict(existing_map or {})
+            source_fallback_count = 0
+            for item in chunk_items:
+                item_id = item["id"]
+                if (mapped.get(item_id) or "").strip():
+                    continue
+                mapped[item_id] = item["t"]
+                source_fallback_count += 1
+            return mapped, {
+                "calls": 0,
+                "retries": 0,
+                "response_chars": 0,
+                "source_fallback_blocks": source_fallback_count,
+                "source_fallback_ids": [item["id"] for item in chunk_items if not (existing_map or {}).get(item["id"])],
+                "max_split_level": 0,
+                "reason": "source_fallback_after_split",
+            }
+
+        def translate_missing_item(item, missing_rank):
+            translated_map, meta = translate_structured_items_once(
+                [item],
+                llm_options,
+                batch_label=(
+                    f"page={page} missing_item={missing_rank} chars={len(item.get('t', ''))} split=single"
+                ),
+                request_meta={
+                    "mode": "page_item_fallback",
+                    "strategy": "structured_json",
+                    "kind": item.get("kind", "unknown"),
+                    "page": page,
+                    "items": 1,
+                    "chars": len(item.get("t", "")),
+                    "split_level": "single",
+                },
+            )
+            if isinstance(translated_map, dict):
+                return translated_map.get(item["id"], ""), meta
+            return "", meta
+
+        def merge_stats(base_stats, child_stats):
+            base_stats["calls"] += int(child_stats.get("calls", 0))
+            base_stats["retries"] += int(child_stats.get("retries", 0))
+            base_stats["source_fallback_blocks"] += int(child_stats.get("source_fallback_blocks", 0))
+            base_stats["source_fallback_ids"].extend(child_stats.get("source_fallback_ids", []))
+            base_stats["response_chars"] += int(child_stats.get("response_chars", 0))
+            base_stats["max_split_level"] = max(
+                int(base_stats.get("max_split_level", 0)),
+                int(child_stats.get("max_split_level", 0)),
+            )
+
+        def translate_chunk_adaptive(chunk_items, split_level):
+            last_meta = {"reason": "unknown"}
+            retry_used = 0
+            translated_chunk = None
+            response_chars_sum = 0
+
+            for attempt in range(1, max_attempts + 1):
+                translated_chunk, meta = translate_structured_items_once(
+                    chunk_items,
+                    llm_options,
+                    batch_label=(
+                        f"page={page} items={len(chunk_items)} chars={sum(len(item.get('t', '')) for item in chunk_items)} "
+                        f"split={split_level}"
+                    ),
+                    request_meta={
+                        "mode": "page_batch",
+                        "strategy": "structured_json",
+                        "kind": "mixed",
+                        "page": page,
+                        "items": len(chunk_items),
+                        "chars": sum(len(item.get("t", "")) for item in chunk_items),
+                        "split_level": split_level,
+                    },
+                )
+
+                meta = meta if isinstance(meta, dict) else {"reason": "unknown"}
+                last_meta = meta
+                response_chars_sum += int(meta.get("response_chars", 0))
+
+                if translated_chunk is not None:
+                    break
+
+                if attempt < max_attempts:
+                    retry_used += 1
+                    reason = meta.get("reason", "unknown")
+                    log_warn(
+                        f"[LLM page] retry page={page} split={split_level} "
+                        f"attempt={attempt}/{max_attempts} reason={reason}"
+                    )
+
+            if translated_chunk is not None:
+                missing_items = [item for item in chunk_items if not (translated_chunk.get(item["id"]) or "").strip()]
+                if missing_items:
+                    repaired = dict(translated_chunk)
+                    missing_fallback_count = 0
+                    for missing_rank, item in enumerate(missing_items, start=1):
+                        repaired_text, _ = translate_missing_item(item, missing_rank)
+                        if repaired_text.strip():
+                            repaired[item["id"]] = repaired_text.strip()
+                        missing_fallback_count += 1
+
+                    translated_chunk = repaired
+                    if all((repaired.get(item["id"]) or "").strip() for item in chunk_items):
+                        return repaired, {
+                            "calls": 1 + missing_fallback_count,
+                            "retries": retry_used,
+                            "source_fallback_blocks": 0,
+                            "source_fallback_ids": [],
+                            "response_chars": response_chars_sum,
+                            "max_split_level": split_level,
+                            "reason": "ok_with_item_fallback" if missing_fallback_count > 0 else "ok",
+                        }
+
+                if all((translated_chunk.get(item["id"]) or "").strip() for item in chunk_items):
+                    return translated_chunk, {
+                        "calls": 1,
+                        "retries": retry_used,
+                        "source_fallback_blocks": 0,
+                        "source_fallback_ids": [],
+                        "response_chars": response_chars_sum,
+                        "max_split_level": split_level,
+                        "reason": "ok",
+                    }
+
+                # If some items are still missing after per-item fallback, continue splitting.
+                translated_chunk = {
+                    item["id"]: (translated_chunk.get(item["id"]) or "")
+                    for item in chunk_items
+                    if (translated_chunk.get(item["id"]) or "").strip()
+                }
+
+            if split_level < max_split_level and len(chunk_items) > 1:
+                log_warn(
+                    f"[LLM page] split page={page} level={split_level}->{split_level + 1} "
+                    f"items={len(chunk_items)} reason={last_meta.get('reason', 'unknown')}"
+                )
+                merged = {}
+                stats = {
+                    "calls": 0,
+                    "retries": retry_used,
+                    "source_fallback_blocks": 0,
+                    "source_fallback_ids": [],
+                    "response_chars": response_chars_sum,
+                    "max_split_level": split_level,
+                    "reason": "split",
+                }
+                for part in split_items_half(chunk_items):
+                    part_result, part_stats = translate_chunk_adaptive(part, split_level + 1)
+                    merged.update(part_result)
+                    merge_stats(stats, part_stats)
+                stats["calls"] += 1
+                stats["reason"] = "ok_with_split"
+                return merged, stats
+
+            log_warn(
+                f"[LLM page] source_fallback page={page} split={split_level} items={len(chunk_items)}"
+            )
+            fallback_result, fallback_stats = source_fallback(chunk_items, translated_chunk)
+            fallback_stats["calls"] += 1
+            fallback_stats["retries"] += retry_used
+            fallback_stats["response_chars"] += response_chars_sum
+            fallback_stats["max_split_level"] = split_level
+            return fallback_result, fallback_stats
+
+        translated_chunk, adaptive_stats = translate_chunk_adaptive(items, split_level=0)
+        meta = {
+            "reason": "ok_with_warnings" if adaptive_stats.get("source_fallback_blocks", 0) > 0 else "ok",
+            "attempts": int(adaptive_stats.get("retries", 0)) + 1,
+            "retry_count": int(adaptive_stats.get("retries", 0)),
+            "source_fallback_blocks": int(adaptive_stats.get("source_fallback_blocks", 0)),
+            "source_fallback_ids": adaptive_stats.get("source_fallback_ids", []),
+            "response_chars": int(adaptive_stats.get("response_chars", 0)),
+            "max_split_level": int(adaptive_stats.get("max_split_level", 0)),
+            "api_calls": int(adaptive_stats.get("calls", 0)),
+        }
         return page, translated_chunk, meta
 
     if max_workers == 1:
@@ -1206,6 +1464,11 @@ def translate_blocks_llm_page_mode(data, llm_options, max_input_chars=70000, max
                     "max_output_tokens": max_output_tokens,
                     "estimated_total_tokens": request_payload["estimated_prompt_tokens"] + max_output_tokens,
                     "response_chars": int(meta.get("response_chars", 0)) if isinstance(meta, dict) else 0,
+                    "retry_attempts": int(meta.get("attempts", 1)) if isinstance(meta, dict) else 1,
+                    "retry_count": int(meta.get("retry_count", 0)) if isinstance(meta, dict) else 0,
+                    "source_fallback_blocks": int(meta.get("source_fallback_blocks", 0)) if isinstance(meta, dict) else 0,
+                    "max_split_level": int(meta.get("max_split_level", 0)) if isinstance(meta, dict) else 0,
+                    "api_calls": int(meta.get("api_calls", 0)) if isinstance(meta, dict) else 0,
                 }
             )
     else:
@@ -1253,6 +1516,11 @@ def translate_blocks_llm_page_mode(data, llm_options, max_input_chars=70000, max
                     "max_output_tokens": max_output_tokens,
                     "estimated_total_tokens": request_payload["estimated_prompt_tokens"] + max_output_tokens,
                     "response_chars": int(meta.get("response_chars", 0)) if isinstance(meta, dict) else 0,
+                    "retry_attempts": int(meta.get("attempts", 1)) if isinstance(meta, dict) else 1,
+                    "retry_count": int(meta.get("retry_count", 0)) if isinstance(meta, dict) else 0,
+                    "source_fallback_blocks": int(meta.get("source_fallback_blocks", 0)) if isinstance(meta, dict) else 0,
+                    "max_split_level": int(meta.get("max_split_level", 0)) if isinstance(meta, dict) else 0,
+                    "api_calls": int(meta.get("api_calls", 0)) if isinstance(meta, dict) else 0,
                 }
             )
 
@@ -1271,13 +1539,19 @@ def translate_blocks_llm_page_mode(data, llm_options, max_input_chars=70000, max
             block_copy["text"] = original_text
         results.append(block_copy)
 
+    pages_with_retries = sum(1 for p in page_summaries if int(p.get("retry_count", 0)) > 0)
+    source_fallback_blocks = sum(int(p.get("source_fallback_blocks", 0)) for p in page_summaries)
+
     return results, {
         "used": True,
-        "reason": "ok",
+        "reason": "ok_with_warnings" if source_fallback_blocks > 0 else "ok",
         "pages_total": len(page_items),
         "pages_translated": len(page_summaries),
         "page_summaries": page_summaries,
         "max_input_chars": max_input_chars,
+        "page_retry_count": int(page_retry_count),
+        "pages_with_retries": pages_with_retries,
+        "source_fallback_blocks": source_fallback_blocks,
     }
 
 
@@ -1339,17 +1613,6 @@ def translate_with_lmstudio(llm_options, text, keep_markers=False, request_meta=
                 log_label=request_label,
             )
             if translated:
-                detected_echo, echo_detail = detect_verbatim_source_overlap(cleaned, translated)
-                if detected_echo:
-                    match_preview = (echo_detail or {}).get("match", "")
-                    rule = (echo_detail or {}).get("rule", "unknown")
-                    log_warn(
-                        "LLM output included verbatim source English; retrying request. "
-                        f"rule={rule} match={match_preview[:160]}"
-                    )
-                    translated = None
-                    time.sleep(0.5)
-                    continue
                 break
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError, Exception):
             time.sleep(0.5)
@@ -1740,11 +2003,23 @@ def translate_blocks(input_json, output_json, llm_options, debug_json_path=None)
     with open(input_json, "r", encoding="utf-8") as f:
         data = json.load(f)
 
+    target_pages = parse_target_pages(llm_options.get("llm_target_pages"))
+    selected_data = data
+    if target_pages:
+        page_set = set(target_pages)
+        selected_data = [block for block in data if int(block.get("page", -1)) in page_set]
+        log_info(
+            "Page filter enabled: "
+            f"pages={target_pages} selected_blocks={len(selected_data)}/{len(data)}"
+        )
+        if not selected_data:
+            raise RuntimeError(f"No blocks matched requested pages: {target_pages}")
+
     engine = llm_options.get("engine", "google")
     if engine == "llm":
         reset_llm_metrics()
 
-    translation_segments = build_translation_segments(data)
+    translation_segments = build_translation_segments(selected_data)
     engine_label = "LM Studio" if engine == "llm" else "Google Translate"
     llm_translate_mode = llm_options.get("llm_translate_mode", "page")
     llm_page_stats_only = bool(llm_options.get("llm_page_stats_only", False))
@@ -1755,7 +2030,7 @@ def translate_blocks(input_json, output_json, llm_options, debug_json_path=None)
     if engine == "llm" and llm_translate_mode == "page":
         if llm_page_stats_only:
             llm_page_stats = collect_page_request_stats(
-                data,
+                selected_data,
                 llm_options=llm_options["llm"],
                 max_input_chars=max(1000, int(llm_options.get("llm_page_max_chars", 70000))),
             )
@@ -1776,6 +2051,7 @@ def translate_blocks(input_json, output_json, llm_options, debug_json_path=None)
                     "llm_translate_mode": llm_translate_mode,
                     "llm_page_stats_only": True,
                     "llm_page_stats": llm_page_stats,
+                    "llm_target_pages": target_pages,
                 }
                 with open(debug_json_path, "w", encoding="utf-8") as f:
                     json.dump(debug_payload, f, ensure_ascii=False, indent=2)
@@ -1787,19 +2063,36 @@ def translate_blocks(input_json, output_json, llm_options, debug_json_path=None)
 
         log_info("Trying page-wise structured LLM translation...")
         page_results, llm_page_info = translate_blocks_llm_page_mode(
-            data,
+            selected_data,
             llm_options=llm_options["llm"],
             max_input_chars=max(1000, int(llm_options.get("llm_page_max_chars", 70000))),
             max_workers=max(1, int(llm_options.get("max_workers", 1))),
+            page_retry_count=max(0, int(llm_options.get("llm_page_retries", 1))),
         )
         if page_results is not None:
+            translated_by_key = {
+                (block["page"], block["block_idx"]): block
+                for block in page_results
+            }
+            merged_results = []
+            for original_block in data:
+                key = (original_block["page"], original_block["block_idx"])
+                if key in translated_by_key:
+                    merged_results.append(translated_by_key[key])
+                else:
+                    block_copy = original_block.copy()
+                    original_text = original_block.get("text", "")
+                    block_copy["original_text"] = original_text
+                    block_copy["segment_kind"] = classify_block_kind(original_block)
+                    merged_results.append(block_copy)
+
             translated_count = sum(
                 1
-                for block in page_results
+                for block in merged_results
                 if block.get("text") != block.get("original_text") and not is_page_number_or_code(block.get("original_text", ""))
             )
             with open(output_json, "w", encoding="utf-8") as f:
-                json.dump(page_results, f, ensure_ascii=False, indent=2)
+                json.dump(merged_results, f, ensure_ascii=False, indent=2)
 
             if debug_json_path:
                 debug_payload = {
@@ -1816,6 +2109,7 @@ def translate_blocks(input_json, output_json, llm_options, debug_json_path=None)
                     },
                     "llm_translate_mode": llm_translate_mode,
                     "llm_page": llm_page_info,
+                    "llm_target_pages": target_pages,
                 }
                 with open(debug_json_path, "w", encoding="utf-8") as f:
                     json.dump(debug_payload, f, ensure_ascii=False, indent=2)
@@ -1838,6 +2132,7 @@ def translate_blocks(input_json, output_json, llm_options, debug_json_path=None)
                 "workers": 1,
                 "llm_translate_mode": llm_translate_mode,
                 "llm_page": llm_page_info,
+                "llm_target_pages": target_pages,
                 "failure": {
                     "stage": "page_mode",
                     "reason": page_reason,
@@ -1882,7 +2177,14 @@ def translate_blocks(input_json, output_json, llm_options, debug_json_path=None)
     results_by_key = {(block["page"], block["block_idx"]): block for block in translated_blocks}
     results = []
     for original_block in data:
-        block_copy = results_by_key[(original_block["page"], original_block["block_idx"])]
+        key = (original_block["page"], original_block["block_idx"])
+        if key in results_by_key:
+            block_copy = results_by_key[key]
+        else:
+            block_copy = original_block.copy()
+            original_text = original_block.get("text", "")
+            block_copy["original_text"] = original_text
+            block_copy["segment_kind"] = classify_block_kind(original_block)
         results.append(block_copy)
         if block_copy["text"] != block_copy["original_text"] and not is_page_number_or_code(block_copy["original_text"]):
             translated_count += 1
@@ -1896,6 +2198,7 @@ def translate_blocks(input_json, output_json, llm_options, debug_json_path=None)
             "engine": engine,
             "workers": max_workers,
             "llm_translate_mode": llm_translate_mode,
+            "llm_target_pages": target_pages,
         }
         if engine == "llm":
             llm_cfg = llm_options["llm"]
@@ -2090,6 +2393,17 @@ if __name__ == "__main__":
         help="Maximum total input characters per page request in page mode",
     )
     parser.add_argument(
+        "--llm-page-retries",
+        type=int,
+        default=int(os.environ.get("LLM_PAGE_RETRIES", "1")),
+        help="Retry count per page in LLM page mode when response is empty/invalid or warning-prone",
+    )
+    parser.add_argument(
+        "--llm-target-pages",
+        default=os.environ.get("LLM_TARGET_PAGES", ""),
+        help="Optional target page list/range for debug runs (e.g. '0' or '0,2-3'). Pages are 0-based.",
+    )
+    parser.add_argument(
         "--llm-page-stats-only",
         action=argparse.BooleanOptionalAction,
         default=os.environ.get("LLM_PAGE_STATS_ONLY", "0") not in ("0", "false", "False"),
@@ -2117,6 +2431,8 @@ if __name__ == "__main__":
         "max_workers": args.lmstudio_max_workers,
         "llm_translate_mode": args.llm_translate_mode,
         "llm_page_max_chars": args.llm_page_max_chars,
+        "llm_page_retries": args.llm_page_retries,
+        "llm_target_pages": args.llm_target_pages,
         "llm_page_stats_only": args.llm_page_stats_only,
         "llm": {
             "base_url": args.lmstudio_base_url,

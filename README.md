@@ -69,6 +69,7 @@ LMSTUDIO_TEMPERATURE=0.2
 LMSTUDIO_MAX_WORKERS=8
 LLM_TRANSLATE_MODE=page
 LLM_PAGE_MAX_CHARS=70000
+LLM_PAGE_RETRIES=1
 ```
 
 ## 実行方法
@@ -105,6 +106,12 @@ python3 auto_translate.py <source_pdf> [output_pdf] \
   --lmstudio-temperature 0.2 \
   --lmstudio-max-workers 8
 
+# pageモードの安定化オプション
+python3 auto_translate.py <source_pdf> [output_pdf] --engine llm \
+  --llm-translate-mode page \
+  --llm-page-max-chars 12000 \
+  --llm-page-retries 1
+
 # LLM翻訳を使う場合
 python3 auto_translate.py <source_pdf> [output_pdf] --engine llm
 # デフォルト: 1ページ単位の構造化JSON翻訳
@@ -130,6 +137,7 @@ python3 generate.py <source_pdf> <translated_json> <output_pdf>
 - Google翻訳は外部APIの応答状況に影響されます
 - LLM翻訳品質はLM Studioのモデルに依存します
 - `--engine llm` では、既定で1ページ単位の構造化JSON翻訳を実行し、失敗時は従来のsegment/block翻訳へフォールバックします
+- pageモードでは、失敗/警告時にリクエストを段階的に分割して再試行します（1ページ -> 1/2ページ -> 1/4ページ）。1/4ページでも失敗するブロックは英文のまま出力します
 - LLM呼び出しごとに開始/終了ログを表示し、バッチ分割の発生理由も出力します
 - `--lmstudio-timeout` は `0` 以下で強制タイムアウトを無効化できます
 - `--lmstudio-max-workers` を上げると速度は上がりますが、モデル/マシンによっては失敗率が上がります
