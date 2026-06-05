@@ -3,6 +3,7 @@ import json
 import math
 import os
 import re
+import socket
 import time
 import threading
 import urllib.error
@@ -11,7 +12,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-BLOCK_MARKER_TEMPLATE = "__PDFTRANSLATE_BLOCK_{index}__"
+BLOCK_MARKER_TEMPLATE = "__JPDF_BLOCK_{index}__"
 LMSTUDIO_DEFAULT_BASE_URL = "http://127.0.0.1:1234/v1"
 GOOGLE_TRANSLATE_DEFAULT_URL = "https://translate.googleapis.com/translate_a/single"
 
@@ -33,6 +34,7 @@ ANSI_RESET = "\033[0m"
 ANSI_INFO = "\033[96m"
 ANSI_WARN = "\033[93m"
 ANSI_ERROR = "\033[91m"
+ANSI_SUCCESS = "\033[92m"
 
 
 def log_info(message):
@@ -213,6 +215,14 @@ def load_dotenv_candidates(source_pdf_path=None, explicit_env_file=None):
             loaded_files.append(str(path))
 
     return loaded_total, loaded_files
+
+
+def env_with_legacy(new_key, legacy_key, default):
+    if new_key in os.environ:
+        return os.environ.get(new_key)
+    if legacy_key in os.environ:
+        return os.environ.get(legacy_key)
+    return default
 
 
 def parse_target_pages(value):
@@ -490,7 +500,7 @@ def split_translated_segment(translated_text, expected_count):
 
     for raw_line in translated_text.splitlines():
         line = raw_line.strip()
-        match = re.fullmatch(r"__PDFTRANSLATE_BLOCK_(\d+)__", line)
+        match = re.fullmatch(r"__JPDF_BLOCK_(\d+)__", line)
         if match:
             if current_index is not None:
                 segments[current_index] = "\n".join(current_lines).strip()
@@ -510,19 +520,16 @@ def split_translated_segment(translated_text, expected_count):
 
 
 def build_translate_prompt(text, keep_markers=False):
-    marker_rule = "__PDFTRANSLATE_BLOCK_0__ のようなマーカー行は変更せず、必ず単独行のまま保持してください。" if keep_markers else ""
+    marker_rule = "__JPDF_BLOCK_0__ のようなマーカー行は変更せず、必ず単独行のまま保持してください。" if keep_markers else ""
     return (
         "以下の英語テキストを、正確で自然な日本語に翻訳してください。 "
-        "これは厳密な翻訳であり、リライトではありません。意味、因果関係、確率・断定の強さ、事実のニュアンスを厳密に保持してください。 "
-        "すべての文を完全に翻訳し、要約・省略・追加・弱化を行ってはいけません。 "
-        "出力に英語の文や節を残してはいけません。また英語文を別の英語表現に言い換えることも禁止です。 "
-        "そのまま残してよいラテン文字は、URL・メールアドレス・型番・国際的に固定された製品名/ブランド名のみです。 "
-        "見出し、図表ラベル、短い断片、箇条書きも例外なく日本語にしてください。 "
-        "組織名・人名は一般的な日本語表記を優先し、ない場合はカタカナ化し、必要なら原文を1回だけ括弧で補足してください。 "
-        "英語フレーズが残っていたらエラーです。最終出力前に必ず日本語へ直してください。 "
-        "内部手順: まず全体を翻訳し、その後に最終文面を自己検査してください。 "
-        "自己検査では、A-Z/a-z の連続語を確認し、許可例外（URL・メール・型番・国際固定の製品名/ブランド名）以外は必ず日本語へ再翻訳してください。 "
-        "特に長い英語句（3語以上）が1つでも残っていたら不合格として再翻訳してください。 "
+        "厳密翻訳として、意味・因果関係・確率表現・断定/否定・数値を保持してください。 "
+        "要約・省略・追加・言い換えは禁止です。 "
+        "見出し、図表ラベル、短い断片、箇条書きも必ず日本語化してください。 "
+        "英語の文や節は残さないでください。例外は URL・メールアドレス・型番・国際的に固定された製品名/ブランド名のみです。 "
+        "同一の語句・文を連続して繰り返してはいけません。 "
+        "途中で反復が始まった場合は、その場で自然な文末で打ち切り、以降を繰り返さず終了してください。 "
+        "推論過程や自己検査手順は出力しないでください。 "
         "出力は最終的な日本語訳テキストのみを返してください。 "
         f"{marker_rule}\n\n"
         f"原文:\n{text}"
@@ -542,21 +549,20 @@ def build_naturalize_prompt(text):
 def build_structured_translate_prompt(payload_json):
     return (
         "あなたはビジネス文書の英日翻訳者です。 "
-        "各 item について、意味と全情報を保持した厳密な日本語訳を t に作成してください。 "
-        "要約・省略・追加・解釈変更は禁止です。因果関係、確率表現、断定/否定を厳密に保持してください。 "
-        "英語を英語のまま言い換えることは禁止です。原文の英語文は必ず日本語へ翻訳してください。 "
-        "t に英語の文や節を残してはいけません。例外として、URL・メールアドレス・型番・国際的に固定された製品名/ブランド名のみそのまま可。 "
-        "見出し、表のラベル、図中の短い文字列、箇条書きも必ず日本語化してください。 "
-        "組織名・人名は一般的な日本語表記を優先し、ない場合はカタカナ化し、必要なら原文を1回だけ括弧で補足してください。 "
-        "最終チェック: すべての t が日本語として完結し、英語文断片が残っていないことを確認してください。 "
-        "各 item ごとに自己検査を実施し、A-Z/a-z の連続語を検出したら、許可例外以外は必ず日本語に直してください。 "
-        "特に3語以上の英語句が t に残っていたら、その item は不合格として再翻訳してください。 "
-        "id ごとに完全翻訳を保証し、1件でも不合格 item がある状態で出力してはいけません。 "
-        "【重要】以下のidに関するルールを絶対に破ってはいけません。idは入力JSONの値を一文字も変更せず、そのまま出力してください。idを改変・省略・追加・重複してはいけません。idの順序・件数も入力と完全一致させてください。idは絶対に自分で新たに生成せず、入力の値をそのまま使ってください。idが1つでも違えば全体が不合格です。 "
+        "各 item の t を、意味と全情報を保持した厳密な日本語訳にしてください。 "
+        "要約・省略・追加・解釈変更は禁止です。因果関係、確率表現、断定/否定、数値を保持してください。 "
+        "t に英語の文や節を残してはいけません。例外は URL・メールアドレス・型番・国際固定の製品名/ブランド名のみです。 "
+        "見出し、表ラベル、短い断片、箇条書きも必ず日本語化してください。 "
+        "同一の語句・文を連続して繰り返してはいけません。 "
+        "1つの item につき t は1つだけ出力し、同じ内容の反復出力を禁止します。 "
+        "途中で反復が始まった場合は、その item を自然な文末で完結して終了し、次の item に進んでください。 "
+        "推論過程や自己検査手順は出力しないでください。 "
+        "【重要】id は入力JSONの値を一文字も変更せずそのまま返してください。 "
+        "id の改変・省略・追加・重複は禁止です。id の順序と件数も入力と完全一致させてください。 "
         "必ず次の形式の正しい JSON のみを返してください: "
         '{"items":[{"id":"<same id>","t":"<translated text>"}]} . '
         "説明文、Markdownフェンス、余計なキーは出力してはいけません。 "
-        "id は入力と完全一致させ、入力1件につき出力1件を返してください。\n\n"
+        "入力1件につき出力1件を返してください。\n\n"
         f"入力JSON:\n{payload_json}"
     )
 
@@ -617,6 +623,29 @@ def _extract_http_error_detail(body_text):
 
     one_line = re.sub(r"\s+", " ", raw)
     return one_line[:300]
+
+
+def _is_timeout_exception(exc):
+    if isinstance(exc, urllib.error.HTTPError):
+        code = getattr(exc, "code", None)
+        if code in (408, 504, 524):
+            return True
+
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+
+    if isinstance(exc, urllib.error.URLError):
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, (TimeoutError, socket.timeout)):
+            return True
+        if isinstance(reason, str) and "timed out" in reason.lower():
+            return True
+
+    message = str(exc or "").lower()
+    if "timed out" in message or "timeout" in message:
+        return True
+
+    return False
 
 
 def structured_items_response_format():
@@ -704,6 +733,7 @@ def lmstudio_complete(
     temperature=0.2,
     timeout=120,
     max_tokens=4096,
+    repetition_penalty=None,
     log_label="",
     response_format=None,
     allow_response_format_fallback=True,
@@ -736,6 +766,8 @@ def lmstudio_complete(
         "thinking": {"type": "disabled"},
         "enable_thinking": False,
     }
+    if repetition_penalty is not None:
+        payload["repetition_penalty"] = repetition_penalty
     if response_format is not None:
         payload["response_format"] = response_format
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -778,6 +810,7 @@ def lmstudio_complete(
                 temperature=temperature,
                 timeout=timeout,
                 max_tokens=max_tokens,
+                repetition_penalty=repetition_penalty,
                 log_label=log_label,
                 response_format=None,
                 allow_response_format_fallback=False,
@@ -806,7 +839,8 @@ def lmstudio_complete(
     choices = parsed.get("choices", [])
     if not choices:
         elapsed = time.time() - started_at
-        log_warn(f"[LLM call {call_seq}{label}] done in {elapsed:.1f}s (empty choices)")
+        elapsed_colored = f"{ANSI_SUCCESS}{elapsed:.1f}s{ANSI_RESET}"
+        log_warn(f"[LLM call {call_seq}{label}] done in {elapsed_colored} (empty choices)")
         record_llm_metrics(success=True, elapsed=elapsed, prompt_chars=prompt_chars, completion_chars=0, usage=usage)
         return None
 
@@ -814,8 +848,9 @@ def lmstudio_complete(
     extracted_text, extracted_field = _extract_choice_text(first_choice)
     text = extracted_text.strip()
     elapsed = time.time() - started_at
+    elapsed_colored = f"{ANSI_SUCCESS}{elapsed:.1f}s{ANSI_RESET}"
     log_info(
-        f"[LLM call {call_seq}{label}] done in {elapsed:.1f}s "
+        f"[LLM call {call_seq}{label}] done in {elapsed_colored} "
         f"response_chars={len(text)} source_field={extracted_field}"
     )
     record_llm_metrics(success=True, elapsed=elapsed, prompt_chars=prompt_chars, completion_chars=len(text), usage=usage)
@@ -973,6 +1008,7 @@ def translate_structured_items_once(items, llm_options, batch_label="", request_
     combined_label = " ".join(part for part in [batch_label, request_label] if part)
 
     response_text = None
+    last_error_reason = None
     for _ in range(3):
         try:
             response_text = lmstudio_complete(
@@ -982,16 +1018,31 @@ def translate_structured_items_once(items, llm_options, batch_label="", request_
                 temperature=llm_options["temperature"],
                 timeout=llm_options["timeout"],
                 max_tokens=llm_options["max_tokens"],
+                repetition_penalty=llm_options.get("repetition_penalty"),
                 log_label=combined_label,
                 response_format=structured_items_response_format(),
             )
             if response_text:
                 break
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError, Exception):
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError, Exception) as exc:
+            if _is_timeout_exception(exc):
+                last_error_reason = "timeout"
+                # Do not repeat the same payload on timeout; delegate to split-retry flow.
+                break
+            else:
+                last_error_reason = "request_error"
             time.sleep(0.5)
 
     if not response_text:
-        return None, {"reason": "empty_response", "input_chars": input_chars, "items": len(items)}
+        meta = {
+            "reason": "timeout" if last_error_reason == "timeout" else "empty_response",
+            "input_chars": input_chars,
+            "items": len(items),
+        }
+        if last_error_reason == "timeout":
+            # Timeout should immediately enter split-retry flow in page mode.
+            meta["force_split"] = True
+        return None, meta
 
     parsed = parse_structured_translation_response(response_text)
     if not parsed:
@@ -1005,6 +1056,7 @@ def translate_structured_items_once(items, llm_options, batch_label="", request_
                 temperature=min(0.1, float(llm_options.get("temperature", 0.2))),
                 timeout=llm_options["timeout"],
                 max_tokens=llm_options["max_tokens"],
+                repetition_penalty=llm_options.get("repetition_penalty"),
                 log_label=f"{combined_label} repair_json",
                 response_format=structured_items_response_format(),
             )
@@ -1192,7 +1244,7 @@ def build_page_failure_message(page_info, llm_options):
         lines.append(f"- Lower per-page payload size: set LLM_PAGE_MAX_CHARS below {max_input_chars} and retry.")
         lines.append("- Enable page-internal split implementation (split one page into multiple API calls).")
         if configured_max_tokens > 0:
-            lines.append(f"- Reduce LMSTUDIO_MAX_TOKENS from {configured_max_tokens} to 1024 or 768.")
+            lines.append(f"- Reduce LLM_MAX_TOKENS from {configured_max_tokens} to 1024 or 768.")
     elif reason == "page_batch_failed":
         meta = info.get("meta") if isinstance(info.get("meta"), dict) else {}
         lines.append(f"api_meta_reason={meta.get('reason', 'unknown')}")
@@ -1203,11 +1255,11 @@ def build_page_failure_message(page_info, llm_options):
         lines.append("resolution:")
         lines.append("- Keep page mode and retry with smaller payload: LLM_PAGE_MAX_CHARS=12000 (or 8000).")
         if configured_max_tokens > 0:
-            lines.append(f"- Reduce LMSTUDIO_MAX_TOKENS from {configured_max_tokens} to 1024 or 768.")
+            lines.append(f"- Reduce LLM_MAX_TOKENS from {configured_max_tokens} to 1024 or 768.")
         lines.append("- Confirm LM Studio server model/context settings for API endpoint /v1/chat/completions.")
     else:
         lines.append("resolution:")
-        lines.append("- Retry with LLM_PAGE_MAX_CHARS=12000 and LMSTUDIO_MAX_TOKENS=1024.")
+        lines.append("- Retry with LLM_PAGE_MAX_CHARS=12000 and LLM_MAX_TOKENS=1024.")
         lines.append("- Check LM Studio server logs for request rejection details.")
 
     return "\n".join(lines)
@@ -1621,7 +1673,7 @@ def translate_with_lmstudio(llm_options, text, keep_markers=False, request_meta=
     effective_meta = dict(request_meta or {})
     effective_meta.setdefault("chars", len(cleaned))
     if keep_markers:
-        marker_count = len(re.findall(r"__PDFTRANSLATE_BLOCK_\d+__", cleaned))
+        marker_count = len(re.findall(r"__JPDF_BLOCK_\d+__", cleaned))
         effective_meta.setdefault("markers", marker_count)
     request_label = format_request_log_label(effective_meta)
 
@@ -1635,6 +1687,7 @@ def translate_with_lmstudio(llm_options, text, keep_markers=False, request_meta=
                 temperature=llm_options["temperature"],
                 timeout=llm_options["timeout"],
                 max_tokens=llm_options["max_tokens"],
+                repetition_penalty=llm_options.get("repetition_penalty"),
                 log_label=request_label,
             )
             if translated:
@@ -1661,6 +1714,7 @@ def naturalize_with_lmstudio(llm_options, text):
                 temperature=min(0.2, llm_options["temperature"]),
                 timeout=llm_options["timeout"],
                 max_tokens=llm_options["max_tokens"],
+                repetition_penalty=llm_options.get("repetition_penalty"),
             )
             if naturalized:
                 break
@@ -2044,6 +2098,11 @@ def translate_blocks(input_json, output_json, llm_options, debug_json_path=None)
     if engine == "llm":
         reset_llm_metrics()
 
+    if engine == "llm":
+        engine_max_workers = max(1, int(llm_options.get("llm_max_workers", llm_options.get("max_workers", 1))))
+    else:
+        engine_max_workers = max(1, int(llm_options.get("google_max_workers", 1)))
+
     translation_segments = build_translation_segments(selected_data)
     engine_label = "LM Studio" if engine == "llm" else "Google Translate"
     llm_translate_mode = llm_options.get("llm_translate_mode", "page")
@@ -2091,7 +2150,7 @@ def translate_blocks(input_json, output_json, llm_options, debug_json_path=None)
             selected_data,
             llm_options=llm_options["llm"],
             max_input_chars=max(1000, int(llm_options.get("llm_page_max_chars", 70000))),
-            max_workers=max(1, int(llm_options.get("max_workers", 1))),
+            max_workers=engine_max_workers,
             page_retry_count=max(0, int(llm_options.get("llm_page_retries", 1))),
         )
         if page_results is not None:
@@ -2174,8 +2233,9 @@ def translate_blocks(input_json, output_json, llm_options, debug_json_path=None)
     segment_slots = [None] * len(translation_segments)
     segment_debug = [None] * len(translation_segments)
 
-    max_workers = max(1, int(llm_options.get("max_workers", 1)))
+    max_workers = engine_max_workers
     processing_started_at = time.time()
+    last_progress_at = processing_started_at
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(translate_segment, segment, idx, llm_options): idx
@@ -2189,10 +2249,12 @@ def translate_blocks(input_json, output_json, llm_options, debug_json_path=None)
 
             processed_segments = sum(1 for segment in segment_slots if segment is not None)
             if processed_segments % 10 == 0 or processed_segments == len(translation_segments):
-                elapsed = time.time() - processing_started_at
+                now = time.time()
+                interval_elapsed = now - last_progress_at
+                last_progress_at = now
                 log_info(
                     f"Processed {processed_segments}/{len(translation_segments)} segments... "
-                    f"elapsed={format_elapsed(elapsed)}"
+                    f"elapsed={format_elapsed(interval_elapsed)}"
                 )
 
     translated_blocks = []
@@ -2372,38 +2434,64 @@ if __name__ == "__main__":
         help="Translation engine: google (default) or llm",
     )
     parser.add_argument(
+        "--llm-base-url",
         "--lmstudio-base-url",
-        default=os.environ.get("LMSTUDIO_BASE_URL", LMSTUDIO_DEFAULT_BASE_URL),
-        help="LM Studio OpenAI-compatible base URL",
+        dest="llm_base_url",
+        default=env_with_legacy("LLM_BASE_URL", "LMSTUDIO_BASE_URL", LMSTUDIO_DEFAULT_BASE_URL),
+        help="LLM OpenAI-compatible base URL",
     )
     parser.add_argument(
+        "--llm-model",
         "--lmstudio-model",
-        default=os.environ.get("LMSTUDIO_MODEL", "translategemma-4b-it"),
-        help="LM Studio model name",
+        dest="llm_model",
+        default=env_with_legacy("LLM_MODEL", "LMSTUDIO_MODEL", "translategemma-4b-it"),
+        help="LLM model name",
     )
     parser.add_argument(
+        "--llm-timeout",
         "--lmstudio-timeout",
+        dest="llm_timeout",
         type=int,
-        default=int(os.environ.get("LMSTUDIO_TIMEOUT", "0")),
-        help="LM Studio HTTP timeout seconds (<=0 disables forced timeout)",
+        default=int(env_with_legacy("LLM_TIMEOUT", "LMSTUDIO_TIMEOUT", "0")),
+        help="LLM HTTP timeout seconds (<=0 disables forced timeout)",
     )
     parser.add_argument(
+        "--llm-max-tokens",
         "--lmstudio-max-tokens",
+        dest="llm_max_tokens",
         type=int,
-        default=int(os.environ.get("LMSTUDIO_MAX_TOKENS", "4096")),
-        help="LM Studio max_tokens per call",
+        default=int(env_with_legacy("LLM_MAX_TOKENS", "LMSTUDIO_MAX_TOKENS", "4096")),
+        help="LLM max_tokens per call",
     )
     parser.add_argument(
+        "--llm-temperature",
         "--lmstudio-temperature",
+        dest="llm_temperature",
         type=float,
-        default=float(os.environ.get("LMSTUDIO_TEMPERATURE", "0.2")),
-        help="LM Studio sampling temperature",
+        default=float(env_with_legacy("LLM_TEMPERATURE", "LMSTUDIO_TEMPERATURE", "0.2")),
+        help="LLM sampling temperature",
     )
     parser.add_argument(
+        "--llm-repetition-penalty",
+        "--lmstudio-repetition-penalty",
+        dest="llm_repetition_penalty",
+        type=float,
+        default=float(env_with_legacy("LLM_REPETITION_PENALTY", "LMSTUDIO_REPETITION_PENALTY", "1.0")),
+        help="LLM repetition penalty (1.0 disables penalty)",
+    )
+    parser.add_argument(
+        "--llm-max-workers",
         "--lmstudio-max-workers",
+        dest="llm_max_workers",
         type=int,
-        default=int(os.environ.get("LMSTUDIO_MAX_WORKERS", "8")),
-        help="Concurrent translation workers",
+        default=int(env_with_legacy("LLM_MAX_WORKERS", "LMSTUDIO_MAX_WORKERS", "8")),
+        help="Concurrent workers for LLM translation",
+    )
+    parser.add_argument(
+        "--google-max-workers",
+        type=int,
+        default=int(os.environ.get("GOOGLE_MAX_WORKERS", "8")),
+        help="Concurrent workers for Google translation",
     )
     parser.add_argument(
         "--llm-translate-mode",
@@ -2453,18 +2541,22 @@ if __name__ == "__main__":
     translate_options = {
         "engine": args.engine,
         "google_timeout": args.google_timeout,
-        "max_workers": args.lmstudio_max_workers,
+        "llm_max_workers": args.llm_max_workers,
+        "google_max_workers": args.google_max_workers,
+        # Legacy key kept for compatibility in older code paths.
+        "max_workers": args.llm_max_workers,
         "llm_translate_mode": args.llm_translate_mode,
         "llm_page_max_chars": args.llm_page_max_chars,
         "llm_page_retries": args.llm_page_retries,
         "llm_target_pages": args.llm_target_pages,
         "llm_page_stats_only": args.llm_page_stats_only,
         "llm": {
-            "base_url": args.lmstudio_base_url,
-            "model": args.lmstudio_model,
-            "timeout": args.lmstudio_timeout,
-            "max_tokens": args.lmstudio_max_tokens,
-            "temperature": args.lmstudio_temperature,
+            "base_url": args.llm_base_url,
+            "model": args.llm_model,
+            "timeout": args.llm_timeout,
+            "max_tokens": args.llm_max_tokens,
+            "temperature": args.llm_temperature,
+            "repetition_penalty": args.llm_repetition_penalty,
         },
     }
 
