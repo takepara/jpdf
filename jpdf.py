@@ -2404,6 +2404,15 @@ def run_pipeline(source_pdf, output_pdf, translate_options):
         f"total={format_elapsed(total_elapsed)}"
     )
 
+    # Clean up intermediate JSON files unless --debug is set
+    if not translate_options.get("keep_debug_files", False):
+        for json_path in [extracted_json, translated_json, segment_debug_json]:
+            if os.path.exists(json_path):
+                os.remove(json_path)
+                log_info(f"Removed intermediate file: {json_path}")
+    else:
+        log_info(f"Debug mode: keeping intermediate files ({extracted_json}, {translated_json}, {segment_debug_json})")
+
 
 if __name__ == "__main__":
     # Bootstrap parse to know source_pdf/env-file, then load .env before building
@@ -2523,6 +2532,12 @@ if __name__ == "__main__":
         help="Collect per-page LLM payload stats (chars/tokens estimates) without calling LM Studio API",
     )
     parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Keep intermediate JSON files after completion",
+    )
+    parser.add_argument(
         "--google-timeout",
         type=int,
         default=int(os.environ.get("GOOGLE_TIMEOUT", "30")),
@@ -2550,6 +2565,7 @@ if __name__ == "__main__":
         "llm_page_retries": args.llm_page_retries,
         "llm_target_pages": args.llm_target_pages,
         "llm_page_stats_only": args.llm_page_stats_only,
+        "keep_debug_files": args.debug,
         "llm": {
             "base_url": args.llm_base_url,
             "model": args.llm_model,
