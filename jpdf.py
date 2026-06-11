@@ -49,6 +49,20 @@ def log_error(message):
     print(f"{ANSI_ERROR}[ERROR]{ANSI_RESET} {message}", flush=True)
 
 
+def summarize_request_items(payload_json):
+    parsed = parse_structured_translation_response(payload_json)
+    if parsed and isinstance(parsed.get("items"), list):
+        items = parsed["items"]
+        ids = [item.get("id", "") for item in items if isinstance(item, dict)]
+        return {
+            "items": len(items),
+            "first_id": ids[0] if ids else None,
+            "last_id": ids[-1] if ids else None,
+            "ids": ids,
+        }
+    return None
+
+
 def next_llm_call_seq():
     global _LLM_CALL_SEQ
     with _LLM_CALL_SEQ_LOCK:
@@ -262,17 +276,6 @@ def parse_target_pages(value):
 
 def normalize_text(text):
     return re.sub(r"\s+", " ", text).strip()
-
-
-def has_unwanted_english_fragment(text):
-    cleaned = normalize_text(text or "")
-    if not cleaned:
-        return False
-    if re.fullmatch(r"(?:https?://\S+|www\.\S+|\S+@\S+)", cleaned):
-        return False
-    if re.search(r"\b[A-Za-z]{4,}\b", cleaned):
-        return True
-    return False
 
 
 def is_page_number_or_code(text):
@@ -737,12 +740,12 @@ def lmstudio_complete(
     log_label="",
     response_format=None,
     allow_response_format_fallback=True,
+    request_meta=None,
 ):
     call_seq = next_llm_call_seq()
     label = f" {log_label}" if log_label else ""
     started_at = time.time()
     prompt_chars = len(prompt)
-    log_info(f"[LLM call {call_seq}{label}] start prompt_chars={prompt_chars}")
 
     url = f"{base_url.rstrip('/')}/chat/completions"
     payload = {
@@ -770,6 +773,8 @@ def lmstudio_complete(
         payload["repetition_penalty"] = repetition_penalty
     if response_format is not None:
         payload["response_format"] = response_format
+
+    log_info(f"[LLM call {call_seq}{label}] start prompt_chars={prompt_chars}")
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -797,6 +802,15 @@ def lmstudio_complete(
         status = getattr(exc, "code", "?")
         reason = getattr(exc, "reason", "")
         reason_text = f" {reason}" if reason else ""
+        error_record = {
+            "call_seq": call_seq,
+            "log_label": log_label,
+            "status": status,
+            "reason": str(reason),
+            "detail": detail,
+            "elapsed_seconds": elapsed,
+            "response_body": error_body,
+        }
 
         if response_format is not None and allow_response_format_fallback and status in (400, 404, 422):
             log_warn(
@@ -814,6 +828,7 @@ def lmstudio_complete(
                 log_label=log_label,
                 response_format=None,
                 allow_response_format_fallback=False,
+                request_meta=request_meta,
             )
 
         if detail:
@@ -830,7 +845,9 @@ def lmstudio_complete(
         raise
     except Exception as exc:
         elapsed = time.time() - started_at
-        log_error(f"[LLM call {call_seq}{label}] failed after {elapsed:.1f}s: {type(exc).__name__}: {exc}")
+        log_error(
+            f"[LLM call {call_seq}{label}] failed after {elapsed:.1f}s: {type(exc).__name__}: {exc}"
+        )
         record_llm_metrics(success=False, elapsed=elapsed, prompt_chars=prompt_chars, completion_chars=0, usage=None)
         raise
 
@@ -840,7 +857,9 @@ def lmstudio_complete(
     if not choices:
         elapsed = time.time() - started_at
         elapsed_colored = f"{ANSI_SUCCESS}{elapsed:.1f}s{ANSI_RESET}"
-        log_warn(f"[LLM call {call_seq}{label}] done in {elapsed_colored} (empty choices)")
+        log_warn(
+            f"[LLM call {call_seq}{label}] done in {elapsed_colored} (empty choices)"
+        )
         record_llm_metrics(success=True, elapsed=elapsed, prompt_chars=prompt_chars, completion_chars=0, usage=usage)
         return None
 
@@ -854,7 +873,11 @@ def lmstudio_complete(
         f"response_chars={len(text)} source_field={extracted_field}"
     )
     record_llm_metrics(success=True, elapsed=elapsed, prompt_chars=prompt_chars, completion_chars=len(text), usage=usage)
-    return text
+    return {
+        "call_seq": call_seq,
+        "text": text,
+        "source_field": extracted_field,
+    }
 
 
 def strip_json_fences(text):
@@ -991,7 +1014,7 @@ def build_structured_request_payload(items):
     }
 
 
-def translate_structured_items_once(items, llm_options, batch_label="", request_meta=None, allow_text_repair=True):
+def translate_structured_items_once(items, llm_options, batch_label="", request_meta=None):
     request_payload = build_structured_request_payload(items)
     input_chars = request_payload["input_chars"]
     prompt = request_payload["prompt"]
@@ -1008,10 +1031,11 @@ def translate_structured_items_once(items, llm_options, batch_label="", request_
     combined_label = " ".join(part for part in [batch_label, request_label] if part)
 
     response_text = None
+    response_call_seq = None
     last_error_reason = None
     for _ in range(3):
         try:
-            response_text = lmstudio_complete(
+            response_result = lmstudio_complete(
                 base_url=llm_options["base_url"],
                 model=llm_options["model"],
                 prompt=prompt,
@@ -1021,7 +1045,13 @@ def translate_structured_items_once(items, llm_options, batch_label="", request_
                 repetition_penalty=llm_options.get("repetition_penalty"),
                 log_label=combined_label,
                 response_format=structured_items_response_format(),
+                request_meta=effective_meta,
             )
+            if isinstance(response_result, dict):
+                response_text = response_result.get("text")
+                response_call_seq = response_result.get("call_seq")
+            else:
+                response_text = response_result
             if response_text:
                 break
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError, Exception) as exc:
@@ -1038,6 +1068,7 @@ def translate_structured_items_once(items, llm_options, batch_label="", request_
             "reason": "timeout" if last_error_reason == "timeout" else "empty_response",
             "input_chars": input_chars,
             "items": len(items),
+            "call_seq": response_call_seq,
         }
         if last_error_reason == "timeout":
             # Timeout should immediately enter split-retry flow in page mode.
@@ -1048,8 +1079,9 @@ def translate_structured_items_once(items, llm_options, batch_label="", request_
     if not parsed:
         repair_prompt = build_json_repair_prompt(response_text, expected_items_count=len(items))
         repaired_response = None
+        repaired_call_seq = None
         try:
-            repaired_response = lmstudio_complete(
+            repaired_result = lmstudio_complete(
                 base_url=llm_options["base_url"],
                 model=llm_options["model"],
                 prompt=repair_prompt,
@@ -1059,16 +1091,32 @@ def translate_structured_items_once(items, llm_options, batch_label="", request_
                 repetition_penalty=llm_options.get("repetition_penalty"),
                 log_label=f"{combined_label} repair_json",
                 response_format=structured_items_response_format(),
+                request_meta={
+                    **effective_meta,
+                    "mode": "repair_json",
+                    "expected_items": len(items),
+                },
             )
+            if isinstance(repaired_result, dict):
+                repaired_response = repaired_result.get("text")
+                repaired_call_seq = repaired_result.get("call_seq")
+            else:
+                repaired_response = repaired_result
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError, Exception):
             repaired_response = None
 
         parsed = parse_structured_translation_response(repaired_response)
         if not parsed:
+            log_warn(
+                "invalid_json_response_detected: "
+                f"items={len(items)} chars={input_chars} label={combined_label}"
+            )
             return None, {
                 "reason": "invalid_json_response",
                 "input_chars": input_chars,
                 "items": len(items),
+                "call_seq": response_call_seq,
+                "repair_call_seq": repaired_call_seq,
                 "response_preview": (response_text or "")[:400],
             }
 
@@ -1104,7 +1152,7 @@ def translate_structured_items_once(items, llm_options, batch_label="", request_
         extra_count = len(extra_ids)
         log_warn(
             "id_mismatch_detected: "
-            f"missing={missing_count} extra={extra_count}"
+            f"missing={missing_count} extra={extra_count} call_seq={response_call_seq}"
         )
         # Fallback 1: remap by position when model returned same count but wrong IDs.
         if len(output_texts_in_order) == len(source_items_by_index):
@@ -1124,52 +1172,19 @@ def translate_structured_items_once(items, llm_options, batch_label="", request_
             log_warn("[id_mismatch] remap不可。分割再実行を要求")
             force_split = True
 
-    if allow_text_repair and not force_split:
-        suspect_items = [item for item in items if has_unwanted_english_fragment(translated_by_id.get(item["id"], ""))]
-        if suspect_items:
-            log_info(f"[id_mismatch] {len(suspect_items)}件のテキスト修復を試行")
-            repaired_by_id = dict(translated_by_id)
-            repaired_count = 0
-            for suspect_rank, item in enumerate(suspect_items, start=1):
-                suspect_map, suspect_meta = translate_structured_items_once(
-                    [item],
-                    llm_options,
-                    batch_label=f"{combined_label} quality_repair={suspect_rank}",
-                    request_meta={
-                        "mode": "quality_repair",
-                        "strategy": "structured_json",
-                        "kind": item.get("kind", "unknown"),
-                        "items": 1,
-                        "chars": len(item.get("t", "")),
-                        "page": effective_meta.get("page"),
-                        "block_idx": effective_meta.get("block_idx"),
-                    },
-                    allow_text_repair=False,
-                )
-                suspect_text = ""
-                if isinstance(suspect_map, dict):
-                    suspect_text = (suspect_map.get(item["id"]) or "").strip()
-                if suspect_text:
-                    repaired_by_id[item["id"]] = suspect_text
-                    repaired_count += 1
-
-            if repaired_count > 0:
-                log_info(f"[id_mismatch] テキスト修復で{repaired_count}件回復")
-                translated_by_id = repaired_by_id
-                actual_ids = set(translated_by_id.keys())
-            else:
-                log_warn("[id_mismatch] テキスト修復でも回復せず。分割再実行を要求")
-                force_split = True
-
     meta = {
         "reason": "ok_with_warnings" if had_id_mismatch else "ok",
         "input_chars": input_chars,
         "items": len(items),
         "response_chars": len(response_text),
+        "call_seq": response_call_seq,
         "id_mismatch_warning": had_id_mismatch,
         "id_mismatch_missing": missing_count,
         "id_mismatch_extra": extra_count,
     }
+    if had_id_mismatch:
+        meta["expected_ids"] = sorted(expected_ids)
+        meta["actual_ids"] = sorted(actual_ids)
     if force_split:
         meta["force_split"] = True
     return translated_by_id, meta
@@ -1680,7 +1695,7 @@ def translate_with_lmstudio(llm_options, text, keep_markers=False, request_meta=
     translated = None
     for _ in range(3):
         try:
-            translated = lmstudio_complete(
+            translated_result = lmstudio_complete(
                 base_url=llm_options["base_url"],
                 model=llm_options["model"],
                 prompt=prompt,
@@ -1689,7 +1704,9 @@ def translate_with_lmstudio(llm_options, text, keep_markers=False, request_meta=
                 max_tokens=llm_options["max_tokens"],
                 repetition_penalty=llm_options.get("repetition_penalty"),
                 log_label=request_label,
+                request_meta=effective_meta,
             )
+            translated = translated_result.get("text") if isinstance(translated_result, dict) else translated_result
             if translated:
                 break
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError, Exception):
@@ -1707,7 +1724,7 @@ def naturalize_with_lmstudio(llm_options, text):
     naturalized = None
     for _ in range(3):
         try:
-            naturalized = lmstudio_complete(
+            naturalized_result = lmstudio_complete(
                 base_url=llm_options["base_url"],
                 model=llm_options["model"],
                 prompt=prompt,
@@ -1715,7 +1732,9 @@ def naturalize_with_lmstudio(llm_options, text):
                 timeout=llm_options["timeout"],
                 max_tokens=llm_options["max_tokens"],
                 repetition_penalty=llm_options.get("repetition_penalty"),
+                request_meta={"mode": "naturalize", "chars": len(cleaned)},
             )
+            naturalized = naturalized_result.get("text") if isinstance(naturalized_result, dict) else naturalized_result
             if naturalized:
                 break
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError, Exception):
