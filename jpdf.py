@@ -239,6 +239,13 @@ def env_with_legacy(new_key, legacy_key, default):
     return default
 
 
+def env_bool(name, default=False):
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() not in ("0", "false", "no", "off", "")
+
+
 def parse_target_pages(value):
     raw = str(value or "").strip()
     if not raw:
@@ -740,6 +747,7 @@ def lmstudio_complete(
     log_label="",
     response_format=None,
     allow_response_format_fallback=True,
+    disable_thinking=True,
     request_meta=None,
 ):
     call_seq = next_llm_call_seq()
@@ -766,9 +774,10 @@ def lmstudio_complete(
         ],
         "temperature": temperature,
         "max_tokens": max_tokens,
-        "thinking": {"type": "disabled"},
-        "enable_thinking": False,
     }
+    if disable_thinking:
+        payload["thinking"] = {"type": "disabled"}
+        payload["enable_thinking"] = False
     if repetition_penalty is not None:
         payload["repetition_penalty"] = repetition_penalty
     if response_format is not None:
@@ -828,6 +837,7 @@ def lmstudio_complete(
                 log_label=log_label,
                 response_format=None,
                 allow_response_format_fallback=False,
+                disable_thinking=disable_thinking,
                 request_meta=request_meta,
             )
 
@@ -1045,6 +1055,7 @@ def translate_structured_items_once(items, llm_options, batch_label="", request_
                 repetition_penalty=llm_options.get("repetition_penalty"),
                 log_label=combined_label,
                 response_format=structured_items_response_format(),
+                disable_thinking=llm_options.get("disable_thinking", True),
                 request_meta=effective_meta,
             )
             if isinstance(response_result, dict):
@@ -1091,6 +1102,7 @@ def translate_structured_items_once(items, llm_options, batch_label="", request_
                 repetition_penalty=llm_options.get("repetition_penalty"),
                 log_label=f"{combined_label} repair_json",
                 response_format=structured_items_response_format(),
+                disable_thinking=llm_options.get("disable_thinking", True),
                 request_meta={
                     **effective_meta,
                     "mode": "repair_json",
@@ -1704,6 +1716,7 @@ def translate_with_lmstudio(llm_options, text, keep_markers=False, request_meta=
                 max_tokens=llm_options["max_tokens"],
                 repetition_penalty=llm_options.get("repetition_penalty"),
                 log_label=request_label,
+                disable_thinking=llm_options.get("disable_thinking", True),
                 request_meta=effective_meta,
             )
             translated = translated_result.get("text") if isinstance(translated_result, dict) else translated_result
@@ -1732,6 +1745,7 @@ def naturalize_with_lmstudio(llm_options, text):
                 timeout=llm_options["timeout"],
                 max_tokens=llm_options["max_tokens"],
                 repetition_penalty=llm_options.get("repetition_penalty"),
+                disable_thinking=llm_options.get("disable_thinking", True),
                 request_meta={"mode": "naturalize", "chars": len(cleaned)},
             )
             naturalized = naturalized_result.get("text") if isinstance(naturalized_result, dict) else naturalized_result
@@ -2516,6 +2530,12 @@ if __name__ == "__main__":
         help="Concurrent workers for LLM translation",
     )
     parser.add_argument(
+        "--llm-disable-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("LLM_DISABLE_THINKING", True),
+        help="Disable model thinking/reasoning fields when supported by backend",
+    )
+    parser.add_argument(
         "--google-max-workers",
         type=int,
         default=int(os.environ.get("GOOGLE_MAX_WORKERS", "8")),
@@ -2592,6 +2612,7 @@ if __name__ == "__main__":
             "max_tokens": args.llm_max_tokens,
             "temperature": args.llm_temperature,
             "repetition_penalty": args.llm_repetition_penalty,
+            "disable_thinking": args.llm_disable_thinking,
         },
     }
 
