@@ -1,22 +1,38 @@
 import json
-import fitz # PyMuPDF
+import fitz  # PyMuPDF: PDF の描画・編集ライブラリ
 import os
 import re
 import argparse
 
+# 引用記号のみのテキスト行を除外するためのセット。
+# 日本語の「」や『』などの引用記号のみで構成される行は本文として扱わない。
 QUOTE_ONLY_TOKENS = {"\"", "'", "“", "”", "‘", "’", "「", "」", "『", "』"}
+
+PARAGRAPH_VERTICAL_PADDING_RATIO = 0.16
+PARAGRAPH_VERTICAL_PADDING_MIN = 3.0
+PARAGRAPH_VERTICAL_PADDING_MAX = 14.0
+LIST_VERTICAL_PADDING_RATIO = 0.10
+LIST_VERTICAL_PADDING_MIN = 2.0
+LIST_VERTICAL_PADDING_MAX = 8.0
 
 
 def normalize_list_render_text(text):
+    """箇条書きのテキストを正規化する。
+
+    箇条書きマーカー（•, ・, ●, 番号など）を保持しつつ、
+    マーカー間の空白を整理して「1項目 = 1行」の形式に整える。
+    """
     text = re.sub(r"\s*\n+\s*", " ", text).strip()
     text = re.sub(r"\s{2,}", " ", text)
 
-    # Split list items by common bullet/number markers while keeping the marker.
+    # 箇条書きマーカー（記号または番号）を正規表現で定義。
     bullet_chars = r"[•・●◦▪■□◆◇▶▸▹▻]"
     numbered_markers = r"(?:\([1-9]\d?\)|(?<!\d)[1-9]\d?[.)](?!\d)|[①-⑳])"
     marker_pattern = rf"(?:{bullet_chars}|{numbered_markers})"
 
+    # マーカーの前後に空白を挿入し、分割しやすい状態にする。
     text = re.sub(rf"\s*({marker_pattern})\s*", r" \1 ", text)
+    # マーカーの手前で分割（マーカーは残す）。
     parts = re.split(rf"\s+(?={marker_pattern}\s+)", text)
 
     normalized_lines = []
@@ -25,7 +41,7 @@ def normalize_list_render_text(text):
         if not item:
             continue
 
-        # If marker and body were detached, keep them on one line.
+        # マーカーと本文が離れている場合は、1行にまとめる。
         item = re.sub(rf"^({marker_pattern})\s*", r"\1 ", item)
         item = re.sub(r"\s{2,}", " ", item)
         normalized_lines.append(item)
@@ -39,19 +55,28 @@ def normalize_paragraph_render_text(text):
     text = re.sub(r"\s{2,}", " ", text)
 
     cjk = r"一-龥ぁ-ゔァ-ヴー々〆〤"
-    # Remove spaces that only hurt Japanese paragraph wrapping.
+    # 日本語の前後にある空白を削除（可読性を損なうため）。
     text = re.sub(rf"(?<=[{cjk}])\s+(?=[{cjk}])", "", text)
+    # 日本語と数字の間の空白も整理。
     text = re.sub(rf"(?<=[{cjk}])\s+(?=[0-9A-Za-z%])", "", text)
+    # 数字と日本語の間の空白も整理。
     text = re.sub(rf"(?<=[0-9A-Za-z%])\s+(?=[{cjk}])", "", text)
+    # 数字と % の間の空白も削除。
     text = re.sub(r"(?<=\d)\s+(?=%)", "", text)
     return text
 
 def normalize_render_text(text, segment_kind=None):
+    """テキストを正規化する（segment_kind に応じて処理を切り替える）。
+
+    segment_kind が "list" の場合は箇条書き用、"paragraph" の場合は
+    段落用の正規化を適用する。それ以外の場合は標準的な処理を行う。
+    """
     lines = []
     for raw_line in text.splitlines():
         stripped = raw_line.strip()
         if not stripped:
             continue
+        # 引用記号のみの行は除外する。
         if stripped in QUOTE_ONLY_TOKENS:
             continue
         lines.append(stripped)
@@ -62,10 +87,14 @@ def normalize_render_text(text, segment_kind=None):
     normalized = "\n".join(lines)
     normalized = re.sub(r"\s{2,}", " ", normalized)
 
+    # 日本語文字範囲。
     cjk = r"一-龥ぁ-ゔァ-ヴー々〆〤"
     normalized = re.sub(rf"(?<=[{cjk}])\s+(?=[{cjk}])", "", normalized)
+    # 日本語と数字の間の空白も整理。
     normalized = re.sub(rf"(?<=[{cjk}])\s+(?=[0-9A-Za-z%])", "", normalized)
+    # 数字と日本語の間の空白も整理。
     normalized = re.sub(rf"(?<=[0-9A-Za-z%])\s+(?=[{cjk}])", "", normalized)
+    # 数字と % の間の空白も削除。
     normalized = re.sub(r"(?<=\d)\s+(?=%)", "", normalized)
 
     if segment_kind == "list":
@@ -73,12 +102,18 @@ def normalize_render_text(text, segment_kind=None):
     elif segment_kind == "paragraph":
         normalized = normalize_paragraph_render_text(normalized)
 
+    # 末尾の引用記号を削除。
     normalized = re.sub(r"[\s\u00A0]*[“”‘’「」『』]+$", "", normalized)
 
     return normalized
 
 
 def has_meaningful_vertical_overlap(rect, other, ratio=0.3):
+    """2つの矩形が垂直方向に意味のある重複を持っているか判定する。
+
+    重複率が ratio（デフォルト0.3）以上であれば、同じ行の高さ范围内にあるとみなす。
+    段落の右隣判定に使用する。
+    """
     overlap = min(rect.y1, other.y1) - max(rect.y0, other.y0)
     if overlap <= 0:
         return False
@@ -86,8 +121,12 @@ def has_meaningful_vertical_overlap(rect, other, ratio=0.3):
 
 
 def is_decorative_overlay_block(block, rect, page_rect):
-    # Large background/display words can overlap many rows and should not be
-    # treated as a true right-column neighbor for paragraph clipping.
+    """装飾的なオーバーレイ要素（背景文字など）を判定する。
+
+    大きな表示用文字は多くの行と重なるが、段落の右隣として扱うべきではない。
+    文字数が少なく面積が大きい場合、または高さがページ全体の45%以上の場合に
+    装飾要素とみなす。
+    """
     text_len = len(normalize_render_text(block.get("text", ""), segment_kind=block.get("segment_kind", "")).strip())
     area = rect.width * rect.height
     page_area = max(1.0, page_rect.width * page_rect.height)
@@ -99,9 +138,15 @@ def is_decorative_overlay_block(block, rect, page_rect):
 
 
 def adjust_paragraph_rect(rect, page_rect, peer_rects, peer_blocks, self_index):
-    # Generic rule for any PDF: respect nearest right neighbor in the same rows.
+    """段落の矩形を調整する（右隣がある場合は幅を狭める）。
+
+    段落ボックスの右側に隣接する要素があれば、その位置まで幅を狭める。
+    装飾要素や垂直方向の重複がない場合は元の矩形を維持する。
+    これにより、2段組レイアウトでも正しくテキストが配置される。
+    """
+    # 左余白の計算。
     left_margin = max(0.0, rect.x0 - page_rect.x0)
-    # Keep right margin close to the left margin so lines do not stretch too far.
+    # 右余白は左余白に合わせる（行が広がりすぎないように）。
     mirrored_right_margin = max(24.0, left_margin)
     right_neighbor_boundary = page_rect.x1 - mirrored_right_margin
     has_right_neighbor = False
@@ -109,10 +154,13 @@ def adjust_paragraph_rect(rect, page_rect, peer_rects, peer_blocks, self_index):
     for idx, peer in enumerate(peer_rects):
         if idx == self_index:
             continue
+        # 左端が近い場合は無視。
         if peer.x0 <= rect.x0 + 20:
             continue
+        # 装飾要素の場合は無視。
         if is_decorative_overlay_block(peer_blocks[idx], peer, page_rect):
             continue
+        # 垂直方向の重複がない場合は無視。
         if not has_meaningful_vertical_overlap(rect, peer):
             continue
         has_right_neighbor = True
@@ -125,19 +173,55 @@ def adjust_paragraph_rect(rect, page_rect, peer_rects, peer_blocks, self_index):
     else:
         safe_right = desired_right
 
-    # If original extracted boxes overlap columns, shrink to keep columns separated.
+    # 元の抽出ボックスが列をまたいでいる場合は、幅を狭めて列を分離する。
     if safe_right <= rect.x0 + 20:
         return rect, has_right_neighbor
 
     adjusted = fitz.Rect(rect.x0, rect.y0, safe_right, rect.y1)
     return adjusted, has_right_neighbor
 
+
+def expand_text_rect_for_readability(rect, page_rect, segment_kind, font_size):
+    """読みやすさを考慮してテキストの描画矩形を拡張する。
+
+    段落とリストについては、フォントサイズに応じた縦方向の余白を追加する。
+    これにより、同じフォントサイズでも行間が広く見えるようになる。
+    拡張後の矩形はフォントサイズ探索と実際の描画の両方に使用される。
+    """
+    if segment_kind == "paragraph":
+        pad = max(
+            PARAGRAPH_VERTICAL_PADDING_MIN,
+            min(PARAGRAPH_VERTICAL_PADDING_MAX, float(font_size) * PARAGRAPH_VERTICAL_PADDING_RATIO),
+        )
+    elif segment_kind == "list":
+        pad = max(
+            LIST_VERTICAL_PADDING_MIN,
+            min(LIST_VERTICAL_PADDING_MAX, float(font_size) * LIST_VERTICAL_PADDING_RATIO),
+        )
+    else:
+        return rect
+
+    top = max(page_rect.y0, rect.y0 - pad)
+    bottom = min(page_rect.y1, rect.y1 + pad)
+    if bottom <= top + 4:
+        return rect
+    return fitz.Rect(rect.x0, top, rect.x1, bottom)
+
 def generate_translated_pdf(original_pdf, json_path, output_pdf):
-    # Path to standard macOS Hiragino Sans font
+    """日本語PDFを生成するメイン処理。
+
+    1. フォントの選択（macOSの場合はHiragino Sans GB.ttcを優先）
+    2. JSONからページごとにブロックをグループ化
+    3. 各ページのテキストボックスを赤文字で消去（背景は保持）
+    4. 日本語テキストを元の位置に挿入（フォントサイズを最適化）
+    5. PDFを圧縮して保存
+
+    README と整合性を取りつつ、レイアウトをできるだけ維持する。
+    """
+    # macOSの標準フォント（Hiragino Sans GB.ttc）を使用。
     font_path = "/System/Library/Fonts/Hiragino Sans GB.ttc"
     if not os.path.exists(font_path):
-        # Fallback to universal CJK if Hiragino Sans is missing
-        font_path = None
+        # フォントがない場合はシステムCJKフォントにフォールバック。
         font_name = "cjk"
         print("Hiragino font not found on system. Falling back to built-in CJK font.")
     else:
@@ -149,15 +233,15 @@ def generate_translated_pdf(original_pdf, json_path, output_pdf):
     with open(json_path, "r", encoding="utf-8") as f:
         translated_blocks = json.load(f)
         
-    # Group blocks by page number
+    # ページ番号ごとにブロックをグループ化。
     blocks_by_page = {}
     for block in translated_blocks:
         page_num = block["page"]
         if page_num not in blocks_by_page:
             blocks_by_page[page_num] = []
         blocks_by_page[page_num].append(block)
-        
-    # Binary search helper to find the best font size that fits inside the bounding box
+
+    # バイナリサーチで bounding box に収まる最適なフォントサイズを見つける。
     def find_best_font_size(rect, text, original_fs, page_width, page_height, align=0):
         if not font_path:
             f_file = None
@@ -165,19 +249,20 @@ def generate_translated_pdf(original_pdf, json_path, output_pdf):
         else:
             f_file = font_path
             f_name = "hira"
-            
+
+        # 3pt から元のフォントサイズまで全範囲を許容し、必ずテキストが収まるようにする。
         low = 3.0
-        high = original_fs
+        high = original_fs * 1.05
         best_fs = 3.0
-        
+
         if original_fs <= 3.0:
             return original_fs
-            
-        # Create a scratch document/page to dry-run text insertion
+
+        # 仮のドキュメント/ページを作成してテキスト挿入をシミュレート。
         scratch_doc = fitz.open()
         scratch_page = scratch_doc.new_page(width=page_width, height=page_height)
-        
-        # 12 iterations are extremely fast and narrow down the size to 0.02 pt accuracy
+
+        # 12回のイテレーションで0.02pt精度までフォントサイズを絞り込む。
         for _ in range(12):
             mid = (low + high) / 2
             rc = scratch_page.insert_textbox(rect, text, fontfile=f_file, fontname=f_name, fontsize=mid, align=align)
@@ -186,60 +271,63 @@ def generate_translated_pdf(original_pdf, json_path, output_pdf):
                 low = mid + 0.05
             else:
                 high = mid - 0.05
-                
+
         scratch_doc.close()
         return best_fs
 
     print("Generating translated PDF...", flush=True)
-    
+
     for page_num in sorted(blocks_by_page.keys()):
         if page_num >= len(doc):
             continue
-            
+
         page = doc[page_num]
         page_rect = page.rect
         page_width = page_rect.width
         page_height = page_rect.height
-        
+
         page_blocks = blocks_by_page[page_num]
         page_rects = [fitz.Rect(block["bbox"]) for block in page_blocks]
-        
-        # Step 1: Add redaction annotations for all blocks on this page
-        # Note: We use fill=False to make the background transparent,
-        # which preserves original background designs, colors, lines, and images!
+
+        # Step 1: ページ内の全ブロックに赤文字注釈を追加。
+        # fill=False を使用して背景を透明にし、
+        # 元のデザイン、色、線、画像を保持する。
         for block in page_blocks:
             bbox = fitz.Rect(block["bbox"])
             page.add_redact_annot(bbox, fill=False)
-            
-        # Step 2: Apply redactions (removes original English text, keeps graphics/images)
-        # using integer values for flags to ensure robust compatibility
+
+        # Step 2: 赤文字注釈を適用（英語テキストを消去、図形/画像は保持）。
+        # 互換性のために整数値のフラグを使用。
         page.apply_redactions(images=0, graphics=0)
-        
-        # Step 3: Insert translated Japanese text at the exact same location
+
+        # Step 3: 日本語テキストを元の位置に挿入。
         for block_index, block in enumerate(page_blocks):
             bbox = fitz.Rect(block["bbox"])
             align = 0
-            translated_text = normalize_render_text(block["text"], segment_kind=block.get("segment_kind"))
-            if block.get("segment_kind") == "paragraph":
+            segment_kind = block.get("segment_kind")
+            translated_text = normalize_render_text(block["text"], segment_kind=segment_kind)
+            if segment_kind == "paragraph":
                 bbox, has_right_neighbor = adjust_paragraph_rect(bbox, page_rect, page_rects, page_blocks, block_index)
-                # Justify only on wide single-column paragraphs.
-                if not has_right_neighbor and bbox.width >= page_width * 0.55:
+                # 広い単一列段落のみ全角揃えを適用。
+                if not has_right_neighbor and bbox.width >= page_width * 0.45:
                     align = 3
             original_fs = block["size"]
             color = tuple(block["color"])
-            
-            # Find the best fitting font size
-            best_fs = find_best_font_size(bbox, translated_text, original_fs, page_width, page_height, align=align)
-            
-            # Insert the text using system font or cjk fallback
+            # 読みやすさ用の描画矩形を計算。
+            render_bbox = expand_text_rect_for_readability(bbox, page_rect, segment_kind, original_fs)
+
+            # 最適なフォントサイズを見つける。
+            best_fs = find_best_font_size(render_bbox, translated_text, original_fs, page_width, page_height, align=align)
+
+            # システムフォントまたはCJKフォールバックでテキストを挿入。
             if font_path:
-                page.insert_textbox(bbox, translated_text, fontfile=font_path, fontname="hira", fontsize=best_fs, color=color, align=align)
+                page.insert_textbox(render_bbox, translated_text, fontfile=font_path, fontname="hira", fontsize=best_fs, color=color, align=align)
             else:
-                page.insert_textbox(bbox, translated_text, fontname="cjk", fontsize=best_fs, color=color, align=align)
-                
+                page.insert_textbox(render_bbox, translated_text, fontname="cjk", fontsize=best_fs, color=color, align=align)
+
         print(f"  Processed page {page_num + 1}/{len(doc)}", flush=True)
-        
-    # Step 4: Save optimized and compressed PDF
+
+    # Step 4: 最適化・圧縮してPDFを保存。
     doc.save(output_pdf, garbage=3, deflate=True)
     doc.close()
     print(f"Successfully generated layout-preserved translated PDF: {output_pdf}", flush=True)
