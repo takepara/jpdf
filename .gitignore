@@ -11,3 +11,4 @@ htmlcov/
 .env.*
 !.env.example
 .venv
+.DS_Store
