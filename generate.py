@@ -3,6 +3,7 @@ import fitz  # PyMuPDF: PDF の描画・編集ライブラリ
 import os
 import re
 import argparse
+import math
 
 # 引用記号のみのテキスト行を除外するためのセット。
 # 日本語の「」や『』などの引用記号のみで構成される行は本文として扱わない。
@@ -43,6 +44,15 @@ REDACTION_KEEP_IMAGES = 0
 REDACTION_KEEP_GRAPHICS = 0
 PDF_SAVE_GARBAGE_LEVEL = 3
 SINGLE_COLUMN_JUSTIFY_WIDTH_RATIO = 0.45
+
+# 本文 paragraph を描画時に揃えるための判定・クラスタリング閾値。
+BODY_PARAGRAPH_MIN_LINE_COUNT = 2
+BODY_PARAGRAPH_MIN_TEXT_LENGTH = 40
+BODY_PARAGRAPH_MIN_WIDTH_RATIO = 0.18
+BODY_PARAGRAPH_MAX_SIZE_RATIO = 1.35
+COLUMN_X_TOLERANCE = 36.0
+COLUMN_WIDTH_RATIO_TOLERANCE = 0.35
+PARAGRAPH_TARGET_PERCENTILE = 0.25
 
 
 def normalize_list_render_text(text):
@@ -239,6 +249,96 @@ def expand_text_rect_for_readability(rect, page_rect, segment_kind, font_size):
         return rect
     return fitz.Rect(rect.x0, top, rect.x1, bottom)
 
+
+def is_body_paragraph_block(block, page_rect):
+    """本文としてサイズ統一対象にする paragraph かを判定する。"""
+    if block.get("segment_kind") != "paragraph":
+        return False
+
+    line_count = max(1, int(block.get("line_count", 1)))
+    if line_count < BODY_PARAGRAPH_MIN_LINE_COUNT:
+        return False
+
+    normalized_text = normalize_render_text(block.get("text", ""), segment_kind="paragraph")
+    if len(normalized_text) < BODY_PARAGRAPH_MIN_TEXT_LENGTH:
+        return False
+
+    page_width = max(1.0, page_rect.width)
+    block_width = max(0.0, float(block.get("width", block["bbox"][2] - block["bbox"][0])))
+    if block_width < page_width * BODY_PARAGRAPH_MIN_WIDTH_RATIO:
+        return False
+
+    size = max(MIN_FONT_SIZE, float(block.get("size", MIN_FONT_SIZE)))
+    if size > DEFAULT_FONT_SIZE_FALLBACK(page_rect):
+        return False
+
+    return True
+
+
+def DEFAULT_FONT_SIZE_FALLBACK(page_rect):
+    """本文候補から除外する極端に大きい文字サイズの上限を返す。"""
+    return max(18.0, page_rect.height * 0.03)
+
+
+def group_body_paragraphs_by_column(page_blocks, page_rect):
+    """本文 paragraph を列ごとにグループ化し、block index の配列を返す。"""
+    candidate_indexes = [
+        index for index, block in enumerate(page_blocks) if is_body_paragraph_block(block, page_rect)
+    ]
+    if not candidate_indexes:
+        return []
+
+    groups = []
+    for index in sorted(candidate_indexes, key=lambda idx: (page_blocks[idx].get("x0", page_blocks[idx]["bbox"][0]), idx)):
+        block = page_blocks[index]
+        block_x0 = float(block.get("x0", block["bbox"][0]))
+        block_width = max(1.0, float(block.get("width", block["bbox"][2] - block["bbox"][0])))
+        assigned = False
+
+        for group in groups:
+            anchor = page_blocks[group[0]]
+            anchor_x0 = float(anchor.get("x0", anchor["bbox"][0]))
+            anchor_width = max(1.0, float(anchor.get("width", anchor["bbox"][2] - anchor["bbox"][0])))
+            width_ratio_gap = abs(block_width - anchor_width) / max(block_width, anchor_width)
+            if abs(block_x0 - anchor_x0) <= COLUMN_X_TOLERANCE and width_ratio_gap <= COLUMN_WIDTH_RATIO_TOLERANCE:
+                group.append(index)
+                assigned = True
+                break
+
+        if not assigned:
+            groups.append([index])
+
+    return groups
+
+
+def percentile_value(values, percentile):
+    """昇順値列から指定パーセンタイルの値を返す。"""
+    if not values:
+        return None
+    ordered = sorted(float(value) for value in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = max(0.0, min(1.0, percentile)) * (len(ordered) - 1)
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def compute_column_target_font_sizes(page_blocks, column_groups):
+    """列ごとの本文基準フォントサイズを block index -> size で返す。"""
+    target_sizes = {}
+    for group in column_groups:
+        sizes = [float(page_blocks[index].get("size", MIN_FONT_SIZE)) for index in group]
+        target_size = percentile_value(sizes, PARAGRAPH_TARGET_PERCENTILE)
+        if target_size is None:
+            continue
+        for index in group:
+            target_sizes[index] = target_size
+    return target_sizes
+
 def generate_translated_pdf(original_pdf, json_path, output_pdf):
     """日本語PDFを生成するメイン処理。
 
@@ -320,6 +420,8 @@ def generate_translated_pdf(original_pdf, json_path, output_pdf):
 
         page_blocks = blocks_by_page[page_num]
         page_rects = [fitz.Rect(block["bbox"]) for block in page_blocks]
+        paragraph_column_groups = group_body_paragraphs_by_column(page_blocks, page_rect)
+        paragraph_target_sizes = compute_column_target_font_sizes(page_blocks, paragraph_column_groups)
 
         # Step 1: ページ内の全ブロックに赤文字注釈を追加。
         # fill=False を使用して背景を透明にし、
@@ -344,12 +446,13 @@ def generate_translated_pdf(original_pdf, json_path, output_pdf):
                 if not has_right_neighbor and bbox.width >= page_width * SINGLE_COLUMN_JUSTIFY_WIDTH_RATIO:
                     align = TEXT_ALIGN_JUSTIFY
             original_fs = block["size"]
+            target_fs = min(float(original_fs), float(paragraph_target_sizes.get(block_index, original_fs)))
             color = tuple(block["color"])
             # 読みやすさ用の描画矩形を計算。
-            render_bbox = expand_text_rect_for_readability(bbox, page_rect, segment_kind, original_fs)
+            render_bbox = expand_text_rect_for_readability(bbox, page_rect, segment_kind, target_fs)
 
             # 最適なフォントサイズを見つける。
-            best_fs = find_best_font_size(render_bbox, translated_text, original_fs, page_width, page_height, align=align)
+            best_fs = find_best_font_size(render_bbox, translated_text, target_fs, page_width, page_height, align=align)
 
             # システムフォントまたはCJKフォールバックでテキストを挿入。
             if font_path:
