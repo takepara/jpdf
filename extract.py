@@ -2,6 +2,16 @@ import json
 import fitz # PyMuPDF
 import argparse
 
+# 段落分割時に、インデント差を新しいまとまりとみなす最小幅。
+INDENT_SPLIT_THRESHOLD = 20.0
+
+# 抽出時に span 情報が欠けている場合のフォールバック値。
+DEFAULT_TEXT_BLOCK_TYPE = 0
+DEFAULT_FONT_NAME = "helv"
+DEFAULT_FONT_SIZE = 10.0
+DEFAULT_COLOR_INT = 0
+DEFAULT_COLOR_RGB = (0.0, 0.0, 0.0)
+
 
 def _line_rep_span(line):
     spans = line.get("spans", [])
@@ -47,8 +57,8 @@ def _paragraph_groups_from_lines(lines):
             prev_text = "".join(span.get("text", "") for span in prev_line.get("spans", []))
             prev_x0, _, _, _ = prev_line.get("bbox", (lx0, 0.0, 0.0, 0.0))
 
-            indent_jump_from_prev = (lx0 - prev_x0) >= 20
-            indent_jump_from_group = current_min_x0 is not None and (lx0 - current_min_x0) >= 20
+            indent_jump_from_prev = (lx0 - prev_x0) >= INDENT_SPLIT_THRESHOLD
+            indent_jump_from_group = current_min_x0 is not None and (lx0 - current_min_x0) >= INDENT_SPLIT_THRESHOLD
             should_split_for_indent = (
                 (indent_jump_from_prev or indent_jump_from_group)
                 and ends_sentence(prev_text)
@@ -79,7 +89,7 @@ def extract_pdf_text(pdf_path, json_path):
         reading_order = 0
         
         for block in blocks:
-            if block.get("type") != 0: # Skip image/non-text blocks
+            if block.get("type") != DEFAULT_TEXT_BLOCK_TYPE: # Skip image/non-text blocks
                 continue
             
             lines = block.get("lines", [])
@@ -114,14 +124,14 @@ def extract_pdf_text(pdf_path, json_path):
                     continue
 
                 if rep_span is not None:
-                    font_name = rep_span.get("font", "helv")
-                    font_size = rep_span.get("size", 10.0)
-                    color_int = rep_span.get("color", 0)
+                    font_name = rep_span.get("font", DEFAULT_FONT_NAME)
+                    font_size = rep_span.get("size", DEFAULT_FONT_SIZE)
+                    color_int = rep_span.get("color", DEFAULT_COLOR_INT)
                     color_rgb = fitz.sRGB_to_pdf(color_int)
                 else:
-                    font_name = "helv"
-                    font_size = 10.0
-                    color_rgb = (0.0, 0.0, 0.0)
+                    font_name = DEFAULT_FONT_NAME
+                    font_size = DEFAULT_FONT_SIZE
+                    color_rgb = DEFAULT_COLOR_RGB
 
                 bbox = [x0, y0, x1, y1]
                 extracted_data.append({

@@ -8,12 +8,41 @@ import argparse
 # 日本語の「」や『』などの引用記号のみで構成される行は本文として扱わない。
 QUOTE_ONLY_TOKENS = {"\"", "'", "“", "”", "‘", "’", "「", "」", "『", "』"}
 
+# 段落・箇条書きの描画矩形に追加する縦余白の係数と上下限。
 PARAGRAPH_VERTICAL_PADDING_RATIO = 0.16
 PARAGRAPH_VERTICAL_PADDING_MIN = 3.0
 PARAGRAPH_VERTICAL_PADDING_MAX = 14.0
 LIST_VERTICAL_PADDING_RATIO = 0.10
 LIST_VERTICAL_PADDING_MIN = 2.0
 LIST_VERTICAL_PADDING_MAX = 8.0
+
+# 右隣ブロック判定や段組み分離に使うレイアウト閾値。
+DEFAULT_VERTICAL_OVERLAP_RATIO = 0.3
+DECORATIVE_MAX_TEXT_LENGTH = 12
+DECORATIVE_PAGE_AREA_RATIO = 0.20
+DECORATIVE_TALL_TEXT_LENGTH = 8
+DECORATIVE_PAGE_HEIGHT_RATIO = 0.45
+MIN_COLUMN_GAP_FROM_SELF = 20.0
+RIGHT_NEIGHBOR_PADDING = 10.0
+MIN_MIRRORED_RIGHT_MARGIN = 24.0
+PARAGRAPH_WIDTH_EXPANSION_RATIO = 1.35
+PARAGRAPH_WIDTH_EXPANSION_ABSOLUTE = 120.0
+MIN_ADJUSTED_RECT_WIDTH = 20.0
+MIN_RENDER_RECT_HEIGHT = 4.0
+
+# フォントサイズ探索の下限と探索精度。
+MIN_FONT_SIZE = 3.0
+FONT_SIZE_HEADROOM_RATIO = 1.05
+FONT_SIZE_BINARY_SEARCH_STEPS = 12
+FONT_SIZE_BINARY_SEARCH_DELTA = 0.05
+
+# PyMuPDF の整列指定値と保存最適化設定。
+TEXT_ALIGN_LEFT = 0
+TEXT_ALIGN_JUSTIFY = 3
+REDACTION_KEEP_IMAGES = 0
+REDACTION_KEEP_GRAPHICS = 0
+PDF_SAVE_GARBAGE_LEVEL = 3
+SINGLE_COLUMN_JUSTIFY_WIDTH_RATIO = 0.45
 
 
 def normalize_list_render_text(text):
@@ -108,7 +137,7 @@ def normalize_render_text(text, segment_kind=None):
     return normalized
 
 
-def has_meaningful_vertical_overlap(rect, other, ratio=0.3):
+def has_meaningful_vertical_overlap(rect, other, ratio=DEFAULT_VERTICAL_OVERLAP_RATIO):
     """2つの矩形が垂直方向に意味のある重複を持っているか判定する。
 
     重複率が ratio（デフォルト0.3）以上であれば、同じ行の高さ范围内にあるとみなす。
@@ -130,9 +159,9 @@ def is_decorative_overlay_block(block, rect, page_rect):
     text_len = len(normalize_render_text(block.get("text", ""), segment_kind=block.get("segment_kind", "")).strip())
     area = rect.width * rect.height
     page_area = max(1.0, page_rect.width * page_rect.height)
-    if text_len <= 12 and area >= page_area * 0.20:
+    if text_len <= DECORATIVE_MAX_TEXT_LENGTH and area >= page_area * DECORATIVE_PAGE_AREA_RATIO:
         return True
-    if text_len <= 8 and rect.height >= page_rect.height * 0.45:
+    if text_len <= DECORATIVE_TALL_TEXT_LENGTH and rect.height >= page_rect.height * DECORATIVE_PAGE_HEIGHT_RATIO:
         return True
     return False
 
@@ -147,7 +176,7 @@ def adjust_paragraph_rect(rect, page_rect, peer_rects, peer_blocks, self_index):
     # 左余白の計算。
     left_margin = max(0.0, rect.x0 - page_rect.x0)
     # 右余白は左余白に合わせる（行が広がりすぎないように）。
-    mirrored_right_margin = max(24.0, left_margin)
+    mirrored_right_margin = max(MIN_MIRRORED_RIGHT_MARGIN, left_margin)
     right_neighbor_boundary = page_rect.x1 - mirrored_right_margin
     has_right_neighbor = False
 
@@ -155,7 +184,7 @@ def adjust_paragraph_rect(rect, page_rect, peer_rects, peer_blocks, self_index):
         if idx == self_index:
             continue
         # 左端が近い場合は無視。
-        if peer.x0 <= rect.x0 + 20:
+        if peer.x0 <= rect.x0 + MIN_COLUMN_GAP_FROM_SELF:
             continue
         # 装飾要素の場合は無視。
         if is_decorative_overlay_block(peer_blocks[idx], peer, page_rect):
@@ -164,9 +193,12 @@ def adjust_paragraph_rect(rect, page_rect, peer_rects, peer_blocks, self_index):
         if not has_meaningful_vertical_overlap(rect, peer):
             continue
         has_right_neighbor = True
-        right_neighbor_boundary = min(right_neighbor_boundary, peer.x0 - 10)
+        right_neighbor_boundary = min(right_neighbor_boundary, peer.x0 - RIGHT_NEIGHBOR_PADDING)
 
-    desired_right = min(page_rect.x1 - mirrored_right_margin, rect.x0 + max(rect.width * 1.35, rect.width + 120))
+    desired_right = min(
+        page_rect.x1 - mirrored_right_margin,
+        rect.x0 + max(rect.width * PARAGRAPH_WIDTH_EXPANSION_RATIO, rect.width + PARAGRAPH_WIDTH_EXPANSION_ABSOLUTE),
+    )
 
     if has_right_neighbor:
         safe_right = min(desired_right, right_neighbor_boundary)
@@ -174,7 +206,7 @@ def adjust_paragraph_rect(rect, page_rect, peer_rects, peer_blocks, self_index):
         safe_right = desired_right
 
     # 元の抽出ボックスが列をまたいでいる場合は、幅を狭めて列を分離する。
-    if safe_right <= rect.x0 + 20:
+    if safe_right <= rect.x0 + MIN_ADJUSTED_RECT_WIDTH:
         return rect, has_right_neighbor
 
     adjusted = fitz.Rect(rect.x0, rect.y0, safe_right, rect.y1)
@@ -203,7 +235,7 @@ def expand_text_rect_for_readability(rect, page_rect, segment_kind, font_size):
 
     top = max(page_rect.y0, rect.y0 - pad)
     bottom = min(page_rect.y1, rect.y1 + pad)
-    if bottom <= top + 4:
+    if bottom <= top + MIN_RENDER_RECT_HEIGHT:
         return rect
     return fitz.Rect(rect.x0, top, rect.x1, bottom)
 
@@ -251,26 +283,26 @@ def generate_translated_pdf(original_pdf, json_path, output_pdf):
             f_name = "hira"
 
         # 3pt から元のフォントサイズまで全範囲を許容し、必ずテキストが収まるようにする。
-        low = 3.0
-        high = original_fs * 1.05
-        best_fs = 3.0
+        low = MIN_FONT_SIZE
+        high = original_fs * FONT_SIZE_HEADROOM_RATIO
+        best_fs = MIN_FONT_SIZE
 
-        if original_fs <= 3.0:
+        if original_fs <= MIN_FONT_SIZE:
             return original_fs
 
         # 仮のドキュメント/ページを作成してテキスト挿入をシミュレート。
         scratch_doc = fitz.open()
         scratch_page = scratch_doc.new_page(width=page_width, height=page_height)
 
-        # 12回のイテレーションで0.02pt精度までフォントサイズを絞り込む。
-        for _ in range(12):
+        # 固定回数の二分探索で、収まる最大フォントサイズを安定して求める。
+        for _ in range(FONT_SIZE_BINARY_SEARCH_STEPS):
             mid = (low + high) / 2
             rc = scratch_page.insert_textbox(rect, text, fontfile=f_file, fontname=f_name, fontsize=mid, align=align)
             if rc >= 0:
                 best_fs = mid
-                low = mid + 0.05
+                low = mid + FONT_SIZE_BINARY_SEARCH_DELTA
             else:
-                high = mid - 0.05
+                high = mid - FONT_SIZE_BINARY_SEARCH_DELTA
 
         scratch_doc.close()
         return best_fs
@@ -298,19 +330,19 @@ def generate_translated_pdf(original_pdf, json_path, output_pdf):
 
         # Step 2: 赤文字注釈を適用（英語テキストを消去、図形/画像は保持）。
         # 互換性のために整数値のフラグを使用。
-        page.apply_redactions(images=0, graphics=0)
+        page.apply_redactions(images=REDACTION_KEEP_IMAGES, graphics=REDACTION_KEEP_GRAPHICS)
 
         # Step 3: 日本語テキストを元の位置に挿入。
         for block_index, block in enumerate(page_blocks):
             bbox = fitz.Rect(block["bbox"])
-            align = 0
+            align = TEXT_ALIGN_LEFT
             segment_kind = block.get("segment_kind")
             translated_text = normalize_render_text(block["text"], segment_kind=segment_kind)
             if segment_kind == "paragraph":
                 bbox, has_right_neighbor = adjust_paragraph_rect(bbox, page_rect, page_rects, page_blocks, block_index)
                 # 広い単一列段落のみ全角揃えを適用。
-                if not has_right_neighbor and bbox.width >= page_width * 0.45:
-                    align = 3
+                if not has_right_neighbor and bbox.width >= page_width * SINGLE_COLUMN_JUSTIFY_WIDTH_RATIO:
+                    align = TEXT_ALIGN_JUSTIFY
             original_fs = block["size"]
             color = tuple(block["color"])
             # 読みやすさ用の描画矩形を計算。
@@ -328,7 +360,7 @@ def generate_translated_pdf(original_pdf, json_path, output_pdf):
         print(f"  Processed page {page_num + 1}/{len(doc)}", flush=True)
 
     # Step 4: 最適化・圧縮してPDFを保存。
-    doc.save(output_pdf, garbage=3, deflate=True)
+    doc.save(output_pdf, garbage=PDF_SAVE_GARBAGE_LEVEL, deflate=True)
     doc.close()
     print(f"Successfully generated layout-preserved translated PDF: {output_pdf}", flush=True)
 
